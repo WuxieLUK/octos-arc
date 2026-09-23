@@ -147,6 +147,14 @@ from failure_analyzer import analyze_failure, format_failure_analysis, write_fai
 from final_verification import evaluate_final_verification, write_final_verification_manifests  # noqa: E402
 from guard import TurnMonitor  # noqa: E402
 from llm_proxy import LlmProxy, configured_model_routes  # noqa: E402
+from repair_decision import (  # noqa: E402
+    REPAIR as REPAIR_DECISION,
+    RETRY_VERIFY as RETRY_VERIFY_DECISION,
+    STOP_NO_PROGRESS as STOP_NO_PROGRESS_DECISION,
+    RepairDecisionContext,
+    classify_failure,
+    decide_repair,
+)
 from requirement_analyzer import write_requirement_analyses  # noqa: E402
 from requirement_decomposer import write_decomposition_analyses  # noqa: E402
 from requirement_order import ancestors_of, node_fingerprint, topo_order  # noqa: E402
@@ -1398,6 +1406,8 @@ class Flow:
         self.context_execution_enabled = os.environ.get("OCTOS_ARC_CONTEXT_EXECUTION", "0") != "0"
         self.repair_loop_execution_enabled = os.environ.get("OCTOS_ARC_REPAIR_LOOP_EXECUTION", "0") != "0"
         self.repair_loop_orchestrator_enabled = os.environ.get("OCTOS_ARC_REPAIR_LOOP_ORCHESTRATOR", "0") != "0"
+        self.repair_decision_enabled = os.environ.get("OCTOS_ARC_REPAIR_DECISION", "0") != "0"
+        self.repair_decisions = {"REPAIR": 0, "RETRY_VERIFY": 0, "STOP_NO_PROGRESS": 0}
         self.regression_execution_enabled = os.environ.get("OCTOS_ARC_REGRESSION_EXECUTION", "0") != "0"
         self.regression_orchestrator_enabled = os.environ.get("OCTOS_ARC_REGRESSION_ORCHESTRATOR", "0") != "0"
         self.test_runner_execution_enabled = os.environ.get("OCTOS_ARC_TEST_RUNNER_EXECUTION", "0") != "0"
@@ -1559,6 +1569,55 @@ class Flow:
         if not blocks:
             return ""
         return "\n\n".join(blocks) + "\n\n"
+
+    def _failure_class(self, summary: RunSummary, failures: str = "") -> str:
+        """Coarse, task-agnostic failure class used only as a decision feature."""
+        if getattr(summary, "error", None):
+            return classify_failure(str(summary.error), ())
+        rows = ((r.status, r.message or "") for r in getattr(summary, "results", []) if not r.ok)
+        cls = classify_failure(None, rows)
+        if cls != "logic":
+            return cls
+        if failures:
+            return classify_failure(failures, ())
+        return "logic"
+
+    def _code_state(self) -> tuple[str | None, str]:
+        """Return (HEAD, frontend/backend dirty state) for change detection."""
+        runtime = getattr(self, "runtime", None)
+        git = getattr(runtime, "git", None) if runtime is not None else None
+        head = git.current_head() if git is not None else None
+        dirty = ""
+        if git is not None:
+            try:
+                result = git.run(["status", "--porcelain", "--", "frontend", "backend"], check=False)
+                dirty = (getattr(result, "stdout", "") or "").strip()
+            except Exception:  # noqa: BLE001
+                dirty = ""
+        return head, dirty
+
+    def _code_changed(self, before: tuple[str | None, str]) -> bool:
+        head, dirty = self._code_state()
+        return head != before[0] or dirty != before[1]
+
+    def _repair_decision(self, failure_signature, previous_failure_signature, failure_class: str,
+                         code_changed_since_last_repair: bool | None, attempt: int,
+                         turn_type: str) -> str:
+        """Return a repair decision, preserving baseline behavior when disabled."""
+        if not self.repair_decision_enabled:
+            return REPAIR_DECISION
+        decision = decide_repair(RepairDecisionContext(
+            failure_signature=failure_signature,
+            previous_failure_signature=previous_failure_signature,
+            failure_class=failure_class,
+            code_changed_since_last_repair=code_changed_since_last_repair,
+            attempt=attempt,
+            turn_type=turn_type,
+        ))
+        self.repair_decisions[decision] = self.repair_decisions.get(decision, 0) + 1
+        log(f"[repair-decision] {turn_type} attempt {attempt}: {decision} "
+            f"(class={failure_class}, changed={code_changed_since_last_repair})")
+        return decision
 
     def _analysis_source_for(self, node_id: str | None):
         """Return a task-agnostic analysis source for optional execution modules."""
@@ -2413,6 +2472,7 @@ class Flow:
         best_passed, best_sha, regressions, stalls = -1, self.head(), 0, 0
         rewrite_used = False
         previous_failures = None
+        last_repair_changed = None  # bool|None: did the previous repair change frontend/backend
         self.codegen_blocked = False  # same failure twice in codegen mode -> tool mode for this node
         if self.repair_loop_execution_enabled:
             config = self.repair_loop_config()
@@ -2420,6 +2480,7 @@ class Flow:
                 f"stable_failures={config.stop_after_stable_failures}, regression_required={config.require_regression}")
         for attempt in range(self.repair_rounds + 1):
             summary = self.run_specs(specs)
+            infra_error = summary.error
             if summary.error and summary.killed:
                 log(f"[acceptance] {node_id}: test runner killed ({summary.error[:120]}); no verdict from this round")
                 return None
@@ -2429,12 +2490,14 @@ class Flow:
                 summary = RunSummary(passed=0, total=max(1, len(specs)))
                 passed = 0
             else:
+                infra_error = None
                 passed = summary.passed
                 failures = failure_summaries(summary) + failure_source_context(summary, self.tests_dir)
                 self.record_tests(node_id, specs, summary)
             log(f"[acceptance] {node_id} round {attempt}: {passed}/{summary.total}")
             was_codegen = self.codegen_mode()
             normalized = failure_signature(summary) if summary.results else failures
+            prior_signature = previous_failures
             if normalized and normalized == previous_failures:
                 # Cloud 91aaecaf31af: three codegen rounds, identical observation.
                 self.codegen_blocked = True
@@ -2487,6 +2550,21 @@ class Flow:
             slow_text = ("These tests exceeded the configured slow-test threshold: " + "; ".join(slow) +
                          ". Inspect the failed operations and measured timings before optimizing.\n" + self.perf_text()) if slow else ""
             failure_analysis = self.failure_analysis_text(node_id, summary, failures)
+            if self.repair_decision_enabled:
+                if infra_error:
+                    failure_class = classify_failure(str(infra_error), ())
+                else:
+                    failure_class = classify_failure(None, ((r.status, r.message or "") for r in summary.results if not r.ok))
+                    if failure_class == "logic" and failures:
+                        failure_class = classify_failure(failures, ())
+                decision = self._repair_decision(normalized, prior_signature, failure_class,
+                                                 last_repair_changed, attempt, "node")
+                if decision == RETRY_VERIFY_DECISION:
+                    log(f"[flow] {node_id}: repair decision RETRY_VERIFY; re-running specs without an LLM turn")
+                    continue
+                if decision == STOP_NO_PROGRESS_DECISION:
+                    log(f"[flow] {node_id}: repair decision STOP_NO_PROGRESS; keeping best state")
+                    break
             if passed == 0 and rebuild_prompt is not None and not rewrite_used \
                     and best_passed <= 0 and self.can_rewrite_from_scratch() \
                     and os.environ.get("OCTOS_ARC_REWRITE_ON_ZERO", "1") != "0":
@@ -2494,12 +2572,15 @@ class Flow:
                 log(f"[flow] {node_id}: nothing passed; one full rewrite turn instead of a patch")
                 prompt = rebuild_prompt(failures or "(no detail)")
                 prompt = failure_analysis + prompt
+                before = self._code_state() if self.repair_decision_enabled else None
                 if self.codegen_mode():
                     self.codegen_turn(prompt, min(self.node_timeout, left), f"{node_id} rewrite (repair {attempt + 1})",
                                       spec_chars=getattr(self, "current_spec_chars", 0))
                 else:
                     self.turn(prompt, min(self.node_timeout, left), f"{node_id} rewrite (repair {attempt + 1})",
                               request_budget=int(os.environ.get("OCTOS_ARC_IMPLEMENT_REQUESTS", "20")))
+                if self.repair_decision_enabled:
+                    last_repair_changed = self._code_changed(before)
                 continue
             prompt = REPAIR_PROMPT.format(node_id=node_id, passed=passed, total=summary.total,
                                           failures=failures or "(no detail)", test_location=self.repair_test_location(specs),
@@ -2508,6 +2589,7 @@ class Flow:
                                           sources=self.repair_requirements(node_id) + self.sources_text())
             prompt = failure_analysis + prompt
             compact = self.codegen_repair_prompt(node_id, prompt) if self.codegen_mode() else None
+            before = self._code_state() if self.repair_decision_enabled else None
             if compact is not None:
                 self.codegen_turn(compact,
                                   min(self.node_timeout, left), f"{node_id} repair {attempt + 1}/{self.repair_rounds}",
@@ -2517,6 +2599,8 @@ class Flow:
                     self.codegen_blocked = True
                     log(f"[flow] {node_id}: complete repair evidence unavailable within codegen budget; using tools")
                 self.turn(prompt, min(self.node_timeout, left), f"{node_id} repair {attempt + 1}/{self.repair_rounds}")
+            if self.repair_decision_enabled:
+                last_repair_changed = self._code_changed(before)
         # Failed repairs can leave dirty files without changing HEAD. Restore the files,
         # even when the current commit already equals the best recorded commit.
         if best_passed > 0 and best_sha:
@@ -2993,26 +3077,47 @@ class Flow:
         four more had joined them, with no recovery recorded in between.
         """
         rounds = int(os.environ.get("OCTOS_ARC_CHECKPOINT_REPAIRS", "1"))
+        previous_failing = None
+        last_repair_changed = None
         for attempt in range(rounds):
             if not grouped or self.remaining() < self.min_repair_seconds or self.wound_down():
                 return
             failing = sorted(node for node in grouped if node) or ["the regressed behaviours"]
             failures = failure_summaries(summary) + failure_source_context(summary, self.tests_dir)
             regression_plan = self.regression_execution_text(failing)
-            prompt = REPAIR_PROMPT.format(
-                node_id=", ".join(failing), passed=summary.passed, total=summary.total, failures=failures,
-                test_location=self.repair_test_location(),
-                sources=self.repair_requirements() + self.sources_text(),
-                corrections=self.corrections_text(), slow="",
-                smoke=self.smoke_port, port=self.web_port)
-            self.turn(regression_plan + prompt,
-                min(self.suite_repair_timeout(), max(120, self.remaining() - 200)),
-                f"checkpoint {index} repair {attempt + 1}/{rounds}")
-            self.commit(f"fix: checkpoint {index} regression repair {attempt + 1}")
+            failing_signature = None
+            decision = REPAIR_DECISION
+            if self.repair_decision_enabled:
+                failing_signature = failure_signature(summary)
+                failure_class = self._failure_class(summary, failures)
+                decision = self._repair_decision(failing_signature, previous_failing, failure_class,
+                                                 last_repair_changed, attempt, "checkpoint")
+                if decision == STOP_NO_PROGRESS_DECISION:
+                    log(f"[flow] checkpoint {index}: repair decision STOP_NO_PROGRESS; skipping regression repair")
+                    return
+            if decision == REPAIR_DECISION:
+                prompt = REPAIR_PROMPT.format(
+                    node_id=", ".join(failing), passed=summary.passed, total=summary.total, failures=failures,
+                    test_location=self.repair_test_location(),
+                    sources=self.repair_requirements() + self.sources_text(),
+                    corrections=self.corrections_text(), slow="",
+                    smoke=self.smoke_port, port=self.web_port)
+                before = self._code_state() if self.repair_decision_enabled else None
+                self.turn(regression_plan + prompt,
+                    min(self.suite_repair_timeout(), max(120, self.remaining() - 200)),
+                    f"checkpoint {index} repair {attempt + 1}/{rounds}")
+                if self.repair_decision_enabled:
+                    last_repair_changed = self._code_changed(before)
+                self.commit(f"fix: checkpoint {index} regression repair {attempt + 1}")
+            else:
+                # RETRY_VERIFY: skip the LLM turn, re-run the checkpoint specs below.
+                last_repair_changed = None
             summary = self.run_specs(specs, workers=workers, grader_like=True)
             if summary.error:
                 return
             grouped = nodes_for_failures(summary.results, verified)
+            if self.repair_decision_enabled:
+                previous_failing = failing_signature
             log(f"[acceptance] checkpoint {index} after repair: {summary.passed}/{summary.total}; "
                 f"still regressed {sorted(node for node in grouped if node)}")
             for node in verified:
@@ -3057,6 +3162,7 @@ class Flow:
         last_passed = -1
         unfinished = ""  # what the previous repair turn said it had left to do
         wrote_last = False  # whether that turn got as far as committing an edit
+        last_repair_changed = None  # bool|None: did the previous repair change frontend/backend
         for attempt in range(rounds + 1):
             summary = self.run_specs(all_specs, workers=workers, grader_like=True)
             while summary.error and summary.killed and workers > 1:
@@ -3137,6 +3243,7 @@ class Flow:
             unstable = frozenset(spec for node in passed_a_round
                                  for spec in (self.spec_map.get(node) or []))
             failing_signature = failure_signature(summary, unstable)
+            prior_failing = previous_failing
             if previous_failing is not None and failing_signature == previous_failing:
                 if repeated:
                     log("[acceptance] full suite: failures unchanged after a changed approach; stopping repairs")
@@ -3159,6 +3266,17 @@ class Flow:
             else:
                 repeated = False
             previous_failing = failing_signature
+            if self.repair_decision_enabled:
+                failure_class = self._failure_class(summary, failures)
+                decision = self._repair_decision(failing_signature, prior_failing, failure_class,
+                                                 last_repair_changed, attempt, "full_suite")
+                if decision == RETRY_VERIFY_DECISION:
+                    log("[flow] full suite: repair decision RETRY_VERIFY; re-running full suite without an LLM turn")
+                    last_repair_changed = None
+                    continue
+                if decision == STOP_NO_PROGRESS_DECISION:
+                    log("[flow] full suite: repair decision STOP_NO_PROGRESS; keeping best state")
+                    break
             if attempt == rounds or self.remaining() < 240 or self.wound_down():
                 break
             failing = sorted(k for k in grouped if k) or ["all nodes"]
@@ -3172,8 +3290,11 @@ class Flow:
                 "(e.g. a counter that every browser session shares). Keep persisted data only where the "
                 "requirement demands persistence.\n",
                 slow="", smoke=self.smoke_port, port=self.web_port)
+            before = self._code_state() if self.repair_decision_enabled else None
             _, unfinished = self.turn(prompt, min(self.suite_repair_timeout(), max(120, self.remaining() - 200)),
                                       f"full-suite repair {attempt + 1}/{rounds}")
+            if self.repair_decision_enabled:
+                last_repair_changed = self._code_changed(before)
             wrote_last = self.commit(f"fix: full-suite repair {attempt + 1}")
         # L17 (ported from the Rust harness): deliver the best full-suite round, not the last one.
         if best is not None and best["sha"] and last_passed < best["passed"]:
