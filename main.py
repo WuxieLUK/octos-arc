@@ -1164,6 +1164,111 @@ def http_body(port: int, path: str, timeout: float = 5.0) -> str:
         if conn is not None:
             conn.close()
 
+
+def _route_specs_from_js(blob: str) -> list[str]:
+    """Collect route shapes the router matches hash strings against.
+
+    Only routing tests count (they decide which view renders); navigation
+    targets such as `navigateTo('/repo/...')` are links, not routes, so they
+    are never collected. Sources: regex literals passed to `.match(...)` on a
+    hash variable, string literals passed to `.startsWith(...)` on a hash
+    variable, switch `case '/path':` strings, and `===/==` comparisons of a
+    hash variable against a literal path. `(.+)`/`(.*)` become the multi-segment
+    wildcard `*`; `[^/]+`/`(:param)` become the one-segment wildcard `:p`.
+    """
+    specs: list[str] = []
+    hash_vars = r"(?:h|hash|path|route|href|loc|currentHash|hashPath|location\.hash)"
+    for mm in re.finditer(hash_vars + r"\.match\(\s*/((?:\\.|\[[^\]]*\]|[^/\\])*)/", blob):
+        raw = mm.group(1)
+        if "\\/" not in raw:
+            continue
+        spec = raw.replace("\\/", "/")
+        spec = re.sub(r"\(\.\*\)|\(\.\+\)", "*", spec)
+        spec = re.sub(r"\(\?:[^)]*\)", ":p", spec)
+        spec = re.sub(r"\([^)]*\)", ":p", spec)
+        spec = re.sub(r"\[[^\]]*\]", ":p", spec)
+        spec = spec.replace("^", "").replace("$", "").replace("+", "").replace("?", "")
+        if spec.startswith("/") and len(spec) > 1:
+            specs.append(spec)
+    for m in re.finditer(hash_vars + r"\.startsWith\(\s*(['\"`](/[^'\"`]*?)['\"`])\s*\)", blob):
+        specs.append(m.group(2))
+    specs += re.findall(r"case\s+['\"`](/[^'\"`]*?)['\"`]", blob)
+    for m in re.finditer(r"([A-Za-z_$][\w$]*)\s*(?:===|==)\s*(['\"`](/[^'\"`]*?)['\"`])", blob):
+        if m.group(1) in {"h", "hash", "path", "route", "href", "loc", "currentHash", "hashPath"}:
+            specs.append(m.group(3))
+    return [s for s in specs if s.startswith("/") and len(s) > 1]
+
+
+def _route_handled(specs: list[str], path: str) -> bool:
+    """Exact-segment match: `path` is handled when some collected route spec
+    covers it: every static segment agrees positionally; `:param`, `{param}`
+    and `:p` absorb one segment; `*` absorbs the rest; and a spec ending in `/`
+    (e.g. `h.startsWith('/repo/')` routers) covers every path below it as a
+    prefix. A spec with fewer segments than the path only counts when its last
+    unmatched segment is the `*` wildcard.
+    """
+    path_parts = [p for p in path.split("?", 1)[0].split("/") if p]
+    if not path_parts:
+        return False
+    for spec in specs:
+        if spec.endswith("/") and spec != "/" and path.startswith(spec):
+            return True
+        spec_parts = [p for p in spec.split("/") if p]
+        if len(spec_parts) > len(path_parts):
+            continue
+        ok = True
+        for i, sp in enumerate(spec_parts):
+            if sp == "*":
+                break  # absorbs the rest of the path
+            if sp.startswith(":") or sp.startswith("{") or sp == ":p":
+                continue
+            if sp != path_parts[i]:
+                ok = False
+                break
+        else:
+            if len(spec_parts) != len(path_parts):
+                ok = False
+        if ok:
+            return True
+    return False
+
+
+def _navigate_targets_from_js(blob: str) -> list[str]:
+    """Concrete path templates the app itself navigates to.
+
+    `navigateTo('/repo/' + owner + '/' + name + '/tree/' + branch)` becomes
+    `/repo/:v/:v/tree/:v` (literals stay, each variable gap is one `:v`
+    segment). The static navigation check then requires the router to handle
+    every such template, so an app that navigates to `/tree/` paths without a
+    matching router route is caught before submission.
+    """
+    out: list[str] = []
+    for mm in re.finditer(r"navigateTo\(\s*([^;]+?)\s*\)", blob):
+        args = mm.group(1)
+        if not re.search(r"['\"`]", args):
+            continue
+        path = ""
+        for part in re.split(r"(['\"`][^'\"`]*['\"`])", args):
+            m = re.match(r"['\"`]([^'\"`]*)['\"`]", part)
+            if m:
+                frag = m.group(1)
+                # only `/`-prefixed literals are path fragments; a value literal
+                # like 'main' is a segment the caller injects, same as a variable
+                if frag.startswith("/"):
+                    path += frag
+                else:
+                    path += "/:v"
+            elif part.strip():
+                path += "/:v"
+        if path.startswith("/") and ":v" in path:
+            out.append(path)
+    for m in re.finditer(r"\.hash\s*=\s*(['\"`]/[^'\"`]*['\"`])", blob):
+        literal = m.group(1)[1:-1]
+        if literal != "/":
+            out.append(literal)
+    return out
+
+
 def compact_spec_lines(text: str) -> str:
     """The spec's statements without imports, blank lines, `await` and closing
     braces — what a page must satisfy, in the spec's own words."""
@@ -1293,6 +1398,16 @@ Fix frontend/ and/or backend/ so these tests pass without breaking the passing o
 For auth/session failures, repair the shared session path first: session persistence, current-session API, client session loader, global provider/state, shell/header/navigation consumers, then route behavior.
 For persistent data, initialize required records only for a new store or an explicit migration. Later startups must preserve user edits, deletions and archive state; a missing record does not mean the store is new. Reset data only when the requirements explicitly demand it.
 """ + PORT_RULES
+
+
+FALLBACK_REPAIR_PROMPT = """\
+Requirement-derived verification of {node_id} failed ({passed}/{total} checks). The checks build the frontend, start the backend the way the grader does, probe GET /api/health and unknown paths, request every route the requirement mentions, and statically match the page's hash links against the router. Failures:
+{failures}
+{test_location}
+{corrections}{sources}
+Fix frontend/ and/or backend/ so these checks pass without breaking earlier nodes. Classify each failure before editing (build/start, health endpoint, unknown-path crash, missing route, or a hash link no router case handles - a link that changes the URL while the old view stays on screen or falls back to a default view fails every flow that starts from it). Add a hashchange/popstate listener or a navigation handler for every hash link and make /api/health answer 2xx/3xx. The harness rebuilds, restarts and re-runs these checks right after your turn. Preserve behavior beyond the checked routes and keep every emitted file small enough to re-emit whole.
+""" + PORT_RULES
+
 
 FINAL_CHECK_PROMPT = """\
 Final end-to-end check of the web application in the current directory:
@@ -1488,6 +1603,7 @@ class Flow:
         self.designs: dict[str, dict] = {}
         self.visual_refs: dict[str, list[dict]] = {}
         self.test_verdict: dict[str, bool | None] = {}
+        self.fallback_failures: dict[str, list[str]] = {}
         self.checkpoint_regressions: set[str] = set()
         self.impl_failed: list[str] = []
         self.pending_corrections: list[str] = []
@@ -2015,11 +2131,17 @@ class Flow:
     def static_navigation_check(self) -> list[str]:
         """Generic SPA sanity: hash-routed links must re-render on click.
 
-        Scans the workspace for pages that contain href="#/... links but no
-        hashchange/popstate listener and no onclick navigation handler on those
-        links. Such links change the URL while the old view stays on screen,
-        which makes every link-driven flow fail. Task-agnostic: it only reports
-        a defect when hash navigation exists without a re-render mechanism.
+        Two checks:
+        1. Pages with hash links but no hashchange/popstate listener and no
+           onclick navigation handler: clicking changes the URL while the old
+           view stays on screen, which makes every link-driven flow fail.
+        2. Pages WITH a listener whose hash links still match no router route
+           (switch cases, quoted route literals, anchored regex literals):
+           clicking navigates to a view the router does not know, so it falls
+           through to a default/empty view. Cloud 23213a9f57ff: every repo link
+           was `#/repo/.../tree/...` but handleRoute had no `/tree/` route, so
+           all repo-driven flows landed back on the Welcome view.
+        Task-agnostic: it reports only real routing defects.
         """
         root = self.output_dir
         pages = []
@@ -2043,10 +2165,12 @@ class Flow:
             except OSError:
                 continue
             links = re.findall(r'href\s*=\s*["\']#[^"\']*["\']', text)
-            links = [lnk for lnk in links if lnk.rstrip().rstrip("'\"") != 'href="#"']
+            links = [lnk for lnk in links if lnk.strip() not in ('href="#"', "href='#'")]
             if not links:
                 continue
-            scripts = [text]
+            scripts: list[str] = []
+            for m in re.finditer(r'<script(?![^>]*\bsrc\s*=)[^>]*>(.*?)</script>', text, re.IGNORECASE | re.DOTALL):
+                scripts.append(m.group(1))
             for m in re.finditer(r'<script[^>]*src\s*=\s*["\']([^"\']+)["\']', text, re.IGNORECASE):
                 src = m.group(1)
                 if src.startswith(("http:", "https:", "//")):
@@ -2059,22 +2183,54 @@ class Flow:
                     continue
             blob = "\n".join(scripts)
             has_listener = "hashchange" in blob or "popstate" in blob
-            # only pages that perform client-side routing count (a plain page with a
-            # stray hash link is not the SPA navigation defect we gate on)
-            routes = "function render(" in blob or "render()" in blob or "navigate(" in blob
             unhandled = [lnk for lnk in links if "onclick" not in lnk]
-            if has_listener or not routes or not unhandled:
-                continue
             rel = page.relative_to(root).as_posix()
             if rel in seen:
                 continue
             seen.add(rel)
-            sample = ", ".join(unhandled[:3])
-            defects.append(
-                f"{rel}: {len(unhandled)} hash link(s) ({sample}) have no re-render "
-                f"handler and no hashchange/popstate listener - clicking them changes "
-                f"the URL but keeps the old view"
-            )
+            if not has_listener:
+                nav_targets = _navigate_targets_from_js(blob)
+                if not unhandled and not nav_targets:
+                    continue
+                # only pages that perform client-side routing count (a plain page with a
+                # stray hash link is not the SPA navigation defect we gate on)
+                routes = "function render(" in blob or "render()" in blob or "navigate(" in blob
+                if not routes:
+                    continue
+                if unhandled:
+                    sample = ", ".join(unhandled[:3])
+                    defects.append(
+                        f"{rel}: {len(unhandled)} hash link(s) ({sample}) have no re-render "
+                        f"handler and no hashchange/popstate listener - clicking them changes "
+                        f"the URL but keeps the old view"
+                    )
+                if nav_targets:
+                    sample = ", ".join(nav_targets[:3])
+                    defects.append(
+                        f"{rel}: {len(nav_targets)} navigateTo target(s) ({sample}) but no "
+                        f"hashchange/popstate listener - hash changes never re-render"
+                    )
+                continue
+            specs = _route_specs_from_js(blob)
+            paths = [m.group(1).split("?", 1)[0] for lnk in unhandled
+                     for m in [re.search(r'#([^"\']*)', lnk)] if m]
+            if unhandled:
+                missing = [p for p in paths if p not in ("", "/") and not _route_handled(specs, p)]
+                if missing:
+                    sample = ", ".join("#" + p for p in missing[:3])
+                    defects.append(
+                        f"{rel}: {len(missing)} hash link(s) match no router route ({sample}); "
+                        f"clicking them falls through to a default view (router knows: "
+                        f"{', '.join(specs[:6]) or 'no routes found'})"
+                    )
+            nav_missing = [t for t in _navigate_targets_from_js(blob) if not _route_handled(specs, t)]
+            if nav_missing:
+                sample = ", ".join(nav_missing[:3])
+                defects.append(
+                    f"{rel}: {len(nav_missing)} navigateTo target(s) the router does not handle ({sample}); "
+                    f"clicking them falls through to a default view (router knows: "
+                    f"{', '.join(specs[:6]) or 'no routes found'})"
+                )
         return defects
 
 
@@ -2161,7 +2317,13 @@ class Flow:
 
     def tiny_mode(self, spec_chars: int) -> bool:
         threshold = int(os.environ.get("OCTOS_ARC_TINY_SPEC_CHARS", "1500"))
-        return os.environ.get("OCTOS_ARC_TINY", "1") != "0" and 0 < spec_chars < threshold
+        if os.environ.get("OCTOS_ARC_TINY", "1") == "0" or not self.tests_dir:
+            # No acceptance specs (hackathon trees): `spec_bodies` is a fixed
+            # "(none)" stub (6 chars) that always passed the threshold. The tiny
+            # tier's only verification is running the node's specs, which cannot
+            # happen without specs, so it must never engage in that case.
+            return False
+        return 0 < spec_chars < threshold
 
     def tiny_turn(self, node_id: str, specs: list[str], timeout: int, requirement: dict) -> bool:
         """Tiny-spec tier: harness writes the manifests and a fixed static server, the
@@ -2601,14 +2763,15 @@ class Flow:
         """Requirement-derived smoke/contract verification for a node with no
         acceptance specs (previously a silent skip -> zero repair per node).
 
-        Build + start the app exactly like the grader, then require: the app
+        Runs WITHOUT Playwright (AppServer + HTTP probes), so it works on
+        hackathon trees where the platform provides no tests_dir at all. Build +
+        start the app exactly like the grader, then require: the app
         builds/starts, GET /api/health answers 2xx/3xx, unknown paths do not
-        crash the server, and every route referenced by the requirement answers
-        with a status below 500. Landmark/aria presence is logged as a warning
-        only, so tiny tasks without specs are never failed on it.
+        crash the server, every route referenced by the requirement answers
+        with a status below 500, and every hash link in the pages matches a
+        router route (static check). Failures are recorded in
+        self.fallback_failures[node_id] for the repair loop.
         """
-        if self.runner is None:
-            return None
         node = self.requirement_nodes.get(node_id) or {}
         try:
             text = "\n".join(
@@ -2627,6 +2790,7 @@ class Flow:
             error = f"build/start raised {exc.__class__.__name__}: {exc}"
         if error:
             server.stop()
+            self.fallback_failures[node_id] = [error]
             log(f"[fallback-verify] {node_id} FAILED: {error[:400]}")
             return False
         failures: list[str] = []
@@ -2649,10 +2813,15 @@ class Flow:
                 log(f"[fallback-verify] {node_id}: WARNING / serves no <main>/<nav>/<header>/aria landmarks")
         finally:
             server.stop()
+        nav_defects = self.static_navigation_check()
+        if nav_defects:
+            failures.append("Static navigation: " + " | ".join(nav_defects))
         if failures:
+            self.fallback_failures[node_id] = failures
             for f in failures:
-                log(f"[fallback-verify] {node_id} FAILED: {f}")
+                log(f"[fallback-verify] {node_id} FAILED: {f[:400]}")
             return False
+        self.fallback_failures.pop(node_id, None)
         log(f"[fallback-verify] {node_id} PASSED (build/start/health/robustness/{len(routes)} route(s))")
         return True
 
@@ -2662,13 +2831,18 @@ class Flow:
         `rebuild_prompt(failures)` (optional) yields a full re-implementation
         prompt; it is used only before any behavior has passed verification.
         A failing extension is repaired without replacing working features."""
-        if self.runner is None:
-            return None
         if not specs:
             # Bug B: a node with no acceptance specs (hackathon trees) used to be
-            # silently skipped -> zero verification and zero repair. Verify the
-            # requirement-derived contract instead (build/start/health/routes).
-            return self.fallback_verify(node_id)
+            # silently skipped -> zero verification and zero repair. Drive the
+            # requirement-derived contract (build/start/health/routes/hash links)
+            # with repair rounds instead.
+            return self.fallback_loop(node_id, deadline, rebuild_prompt)
+        if self.runner is None:
+            # Specs exist but Playwright is unavailable (no preinstalled copy and
+            # the private install failed): requirement-derived verification beats
+            # silently returning None and leaving the node unjudged.
+            log(f"[acceptance] {node_id}: Playwright unavailable; requirement-derived fallback loop")
+            return self.fallback_loop(node_id, deadline, rebuild_prompt)
         if self.repair_loop_orchestrator_enabled:
             try:
                 return self.acceptance_loop_orchestrated(node_id, specs, deadline, rebuild_prompt)
@@ -2811,6 +2985,47 @@ class Flow:
         if best_passed > 0 and best_sha:
             self.restore_app(best_sha)
             self.commit(f"{node_id}: keep best acceptance state {best_passed}")
+        return False
+
+    def fallback_loop(self, node_id: str, deadline: float, rebuild_prompt=None) -> bool | None:
+        """Requirement-derived verification with repair rounds (no Playwright).
+
+        Used when a node has no acceptance specs (hackathon trees) or when
+        Playwright is unavailable. Each round builds/starts the app, probes
+        /api/health + unknown paths, checks the requirement's routes and the
+        page's hash links against the router; failures drive a repair turn just
+        like the acceptance loop. This replaced a silent `return None` that left
+        no-spec nodes at zero verification and zero repair (runs 47e57af54308
+        and 23213a9f57ff: 47 nodes, `[tests] no acceptance specs found`,
+        ~0-2/100).
+        """
+        self.codegen_blocked = False
+        for attempt in range(self.repair_rounds + 1):
+            verdict = self.fallback_verify(node_id)
+            if verdict is True:
+                self.commit(f"{node_id} (accepted): fallback verification passes")
+                return True
+            if verdict is None:
+                return None
+            failures = self.fallback_failures.get(node_id) or ["fallback verification failed"]
+            log(f"[acceptance] {node_id} fallback round {attempt}: FAILED ({len(failures)} issue(s))")
+            if attempt >= self.repair_rounds or self.time_up():
+                break
+            left = deadline - time.time()
+            if left < self.min_repair_seconds:
+                log(f"[flow] {node_id}: {left:.0f}s left, below the {self.min_repair_seconds}s a repair needs; keeping state")
+                break
+            self.snapshot_sources(node_id, attempt)
+            failure_text = "\n".join(f"- {f}" for f in failures)
+            prompt = FALLBACK_REPAIR_PROMPT.format(
+                node_id=node_id, passed=0, total=len(failures),
+                failures=failure_text or "(no detail)",
+                test_location=self.repair_test_location([]),
+                corrections=self.corrections_text(), slow="",
+                smoke=self.smoke_port, port=self.web_port,
+                sources=self.repair_requirements(node_id) + self.sources_text())
+            self.turn(prompt, min(self.node_timeout, left), f"{node_id} fallback repair {attempt + 1}/{self.repair_rounds}")
+            self.commit(f"{node_id}: fallback repair {attempt + 1}")
         return False
 
     def acceptance_loop_orchestrated(self, node_id: str, specs: list[str], deadline: float,
@@ -3043,7 +3258,7 @@ class Flow:
         codegen_prompt = None
         implement_timeout = min(self.node_timeout, self.implement_fraction * node_budget, deadline - time.time())
         tiny_ok = False
-        if not corrections and self.codegen_mode() and self.tiny_mode(len(self.spec_bodies(node_id))):
+        if not corrections and self.codegen_mode() and specs and self.tiny_mode(len(self.spec_bodies(node_id))):
             tiny_ok = self.tiny_turn(node_id, specs, implement_timeout, node)
             self.current_spec_chars = len(self.spec_bodies(node_id))
         if tiny_ok:
@@ -3096,7 +3311,7 @@ class Flow:
             self.pending_corrections.append(
                 "Your turn ended without both frontend/package.json and backend/package.json (with `build` and "
                 "`start` scripts) on disk; the harness could not even build the app. Create the missing files.")
-        can_verify_existing = self.has_app() and self.runner is not None and bool(specs)
+        can_verify_existing = self.has_app() and (self.runner is not None or not bool(specs))
         if not ok and not timed_out and not can_verify_existing:
             self.mark("implementation_failed", node_id, text[-500:])
             self.impl_failed.append(node_id)
@@ -3974,7 +4189,8 @@ class Flow:
                     final_ok, _ = self.turn(regression_plan + nav_block + FINAL_CHECK_PROMPT.format(smoke=self.smoke_port, port=self.web_port,
                                                                       tests=self.tests_prompt_for(None),
                                                                       performance=self.perf_text(), ui=self.ui_contract()),
-                                            self.node_timeout, "final check")
+                                            min(self.node_timeout, int(os.environ.get("OCTOS_FINAL_CHECK_TIMEOUT", "600"))),
+                                            "final check")
                     self.commit("chore: final verification pass")
                 rehearsed = self.rehearsal()
                 for node_id in undecided:

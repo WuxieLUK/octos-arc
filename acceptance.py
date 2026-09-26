@@ -844,6 +844,9 @@ class AppServer:
         self.log_file: Path | None = None
 
     def _run(self, cmd: list[str], cwd: Path, timeout: int) -> tuple[int, str]:
+        if os.name == "nt" and cmd and cmd[0] in ("npm", "npx"):
+            # Windows has no bare `npm` executable: subprocess needs npm.cmd.
+            cmd = [cmd[0] + ".cmd", *cmd[1:]]
         try:
             r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout,
                                env=dict(os.environ, **self.env_extra))
@@ -890,7 +893,8 @@ class AppServer:
             env["ARC_EXTRA_PORTS"] = "0"
         try:
             fh = open(self.log_file, "w")
-            self.proc = subprocess.Popen(["npm", "start"], cwd=self.project / "backend", env=env,
+            start_cmd = ["npm.cmd" if os.name == "nt" else "npm", "start"]
+            self.proc = subprocess.Popen(start_cmd, cwd=self.project / "backend", env=env,
                                          stdin=subprocess.DEVNULL, stdout=fh, stderr=subprocess.STDOUT,
                                          start_new_session=True)
         except OSError as exc:
@@ -947,7 +951,10 @@ class AppServer:
     def stop(self) -> None:
         if self.proc is not None:
             try:
-                os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
+                if os.name == "nt":
+                    self.proc.terminate()
+                else:
+                    os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
             except (ProcessLookupError, PermissionError, OSError):
                 pass
             # Collect the owned child's exit status instead of leaving it for PID 1
