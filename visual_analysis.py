@@ -164,6 +164,10 @@ def analyze_visual_references(
     log: Callable[[str], None] | None = None,
 ) -> dict[str, list[dict]]:
     """Return ``{node_id: [{"image_path", "analysis"}]}`` for text prompts."""
+    # On by default: the official tests may reference screenshots, and skipping
+    # them left the model blind to visual contract. Set
+    # OCTOS_ARC_VISUAL_ANALYSIS=0 to skip vision calls on a provider whose
+    # vision model returns no usable text.
     if os.environ.get("OCTOS_ARC_VISUAL_ANALYSIS", "1") == "0":
         return {}
     if not (base_url and api_key and model):

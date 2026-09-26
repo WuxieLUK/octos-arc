@@ -17,6 +17,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 from dataclasses import dataclass, field, replace
@@ -24,11 +25,12 @@ from pathlib import Path
 from typing import Callable
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
-_SPEC_ID = re.compile(r"^(REQ-\d+(?:\.\d+)*)(?=[.\-_ ]|$)")
+_SPEC_ID = re.compile(r"^(REQ-\d+(?:[.-]\d+)*)(?=[.\-_ ]|$)")
 
 
 def spec_node_id(rel_path: str) -> str | None:
-    """`REQ-1.2-user-login.spec.ts` -> `REQ-1.2`; non-spec files -> None."""
+    """`REQ-1.2-user-login.spec.ts` -> `REQ-1.2`, `REQ-1-1-1-x.spec.ts` -> `REQ-1-1-1`;
+    non-spec files -> None."""
     name = Path(rel_path).name
     if not name.endswith(".spec.ts"):
         return None
@@ -40,16 +42,22 @@ def _version_key(req_id: str) -> tuple:
     return tuple(int(p) for p in re.findall(r"\d+", req_id))
 
 
-def map_specs_to_nodes(spec_paths: list[str], node_ids: list[str]) -> tuple[dict, dict]:
+def map_specs_to_nodes(spec_paths: list[str], node_ids: list[str],
+                       log: Callable[[str], None] | None = None) -> tuple[dict, dict]:
     """Assign spec files to requirement nodes.
 
     Returns (mapping, aliases): mapping[node_id] -> [spec paths] with the key
     None holding specs that belong to no single node (regression set);
     aliases[spec_id] -> node_id for spec ids that are not literal node ids.
 
-    Order of preference: literal id match; when the remaining distinct spec
-    ids and the remaining nodes have the same count, pair them in numeric /
-    document order; otherwise attach `REQ-1.x` to an existing `REQ-1` parent.
+    IDs are compared in a canonical dash form, so dot-numbered (REQ-1.1) and
+    dash-numbered (REQ-1-1-1) trees both map. Order of preference: literal id
+    match; canonical (dot<->dash) match; when the remaining distinct spec ids
+    and the remaining nodes have the same count, pair them in numeric /
+    document order; otherwise attach a leaf id to an existing parent, walking
+    up through either separator. Invariant: specs exist but zero nodes matched
+    -> loud warning and the full suite is assigned to every node so node
+    verification is never silently skipped.
     """
     mapping: dict = {nid: [] for nid in node_ids}
     mapping[None] = []
@@ -60,12 +68,23 @@ def map_specs_to_nodes(spec_paths: list[str], node_ids: list[str]) -> tuple[dict
         if sid is None:
             continue
         by_spec_id.setdefault(sid, []).append(path)
+    if not by_spec_id:
+        return mapping, aliases
+    canonical_to_node: dict[str, str] = {str(nid).replace(".", "-"): nid for nid in node_ids}
     unmatched_ids = []
     for sid in sorted(by_spec_id, key=_version_key):
         if sid in mapping:
             mapping[sid].extend(by_spec_id[sid])
-        else:
-            unmatched_ids.append(sid)
+            continue
+        # Hackathon trees number nodes with dashes (REQ-1-1-1) while some spec
+        # files use dots (REQ-1.1.spec.ts); treat them as the same id.
+        canonical = sid.replace(".", "-")
+        if canonical in canonical_to_node:
+            target = canonical_to_node[canonical]
+            mapping[target].extend(by_spec_id[sid])
+            aliases[sid] = target
+            continue
+        unmatched_ids.append(sid)
     free_nodes = [nid for nid in node_ids if not mapping[nid]]
     if unmatched_ids and len(unmatched_ids) == len(free_nodes):
         for sid, nid in zip(unmatched_ids, free_nodes):
@@ -75,17 +94,36 @@ def map_specs_to_nodes(spec_paths: list[str], node_ids: list[str]) -> tuple[dict
     for sid in unmatched_ids:
         parent = sid
         target = None
-        while "." in parent:
-            parent = parent.rsplit(".", 1)[0]
-            if parent in mapping:
-                target = parent
+        while parent:
+            last = max(parent.rfind("."), parent.rfind("-"))
+            if last < 0:
+                break
+            parent = parent[:last]
+            canonical = parent.replace(".", "-")
+            node = canonical_to_node.get(canonical)
+            if node is not None:
+                target = node
                 break
         if target is None:
             mapping[None].extend(by_spec_id[sid])
         else:
             mapping[target].extend(by_spec_id[sid])
             aliases[sid] = target
+    if not any(bool(mapping[nid]) for nid in node_ids):
+        message = (
+            f"[acceptance] WARNING: {len(spec_paths)} spec file(s) parsed but no requirement node "
+            f"matched (nodes: {sorted(node_ids)[:12]}); assigning the full suite to every node so "
+            f"verification is never silently skipped"
+        )
+        if log is not None:
+            log(message)
+        else:
+            print(message, file=sys.stderr)
+        full_suite = [p for paths in by_spec_id.values() for p in paths]
+        for nid in node_ids:
+            mapping[nid] = list(full_suite)
     return mapping, aliases
+
 
 
 @dataclass

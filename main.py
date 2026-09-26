@@ -125,7 +125,8 @@ from acceptance import (  # noqa: E402
     AcceptanceRunner, AppServer, RunSummary, acceptance_work_dir, clip_ends, container_memory_limit, ensure_playwright,
     failure_signature, failure_summaries, failure_source_context, find_playwright_by_search, find_playwright_root, map_specs_to_nodes,
     nodes_for_failures, playwright_candidates, playwright_version_hint, restore_tree,
-    mutated_by_tests, restore_worktree, snapshot_worktree, tree_digest, workers_for_final, reap_workspace_processes)
+    mutated_by_tests, restore_worktree, snapshot_worktree, tree_digest, workers_for_final, reap_workspace_processes,
+    health_probe, robustness_probe)
 from codegen import FORMAT_INSTRUCTIONS, dedupe_nav_links, parse_file_blocks, write_files  # noqa: E402
 from analysis_pipeline import build_analysis_digest, build_pipeline_artifacts, write_pipeline_reports  # noqa: E402
 from constraint_boundary_analyzer import write_constraint_analyses  # noqa: E402
@@ -1034,8 +1035,10 @@ UI_CONTRACT_CORE = """\
 UI behavior follows the requirement and the current application:
 - Use semantic controls, accessible names and labels appropriate to each action. Preserve required routes, text, visibility, enabled states and interactions. Choose input types and validation behavior from the requirements; hidden views, dialogs and dynamic rendering are allowed when needed.
 - Keep IDs unique and label associations correct. Repeated text and links can be valid. If an actual locator is ambiguous, inspect its scope and the intended interaction instead of deleting unrelated content.
+- Prefer accessible role+name lookups over data-testid: use semantic controls (<button>, <a>, <input> with labels) and real landmarks (<main>, <nav>, <header>, named <section aria-label="...">). Reserve data-testid for controls with no natural role or name; never make it the only path to required content.
 - A control repeated once per item needs an accessible name that says which item it acts on. Identical names across items leave a name-based lookup resolving to an arbitrary one, and a control that stays exposed after the pointer leaves its item makes that worse.
 - Keep simultaneously available controls independently operable by pointer and keyboard. When adding controls, update their shared layout so their hit areas do not overlap and intercept each other's input.
+- Hash-routed single-page views must re-render on every route change: clicking any in-app link, the browser back/forward buttons, or loading a URL that carries a hash must show the matching view. Never leave the old view on screen while the URL changes. Wire a hashchange/popstate listener or attach a navigation handler to every hash link; verify by clicking every visible link and asserting the view changes.
 - Derive state ownership and persistence from requirements: distinguish per-view, per-session and shared data. Do not reset persisted user data on startup. For persistent data, initialize required records only for a new store or an explicit migration. Later startups must preserve user edits, deletions and archive state; a missing record does not mean the store is new. Reset data only when the requirements explicitly demand it. Provide a loading state when initialization is asynchronous.
 - Use local assets where practical. Add styling, animation, asynchronous updates or external services when required; keep interactions responsive and report failures clearly.
 - Use supplied visual references when relevant. Public tests are examples of required behavior, not permission to hardcode test outcomes or omit untested requirements.
@@ -1054,7 +1057,7 @@ Rules: implement the requirement for general valid inputs and preserve existing 
 """
 
 CODEGEN_SIZE_SMALL = 'Prefer a small implementation, but do not omit required behavior, accessibility, styling or validation to meet an arbitrary line count.'
-CODEGEN_SIZE_FULL = "Keep the implementation concise while preserving all required behavior and the existing architecture. Derive navigation, authentication, storage and validation from the requirements. Public tests illustrate contracts; handle other valid inputs too. Do not force a navigation placeholder, cookie name, redirect, validation message or rendering strategy. Fix actual ambiguous controls in their intended scope without deleting legitimate repeated links or text. Keep simultaneously available controls independently operable by pointer and keyboard. When adding controls, update their shared layout so their hit areas do not overlap and intercept each other's input."
+CODEGEN_SIZE_FULL = "Keep the implementation concise while preserving all required behavior and the existing architecture. Derive navigation, authentication, storage and validation from the requirements. Public tests illustrate contracts; handle other valid inputs too. Do not force a navigation placeholder, cookie name, redirect, validation message or rendering strategy. Fix actual ambiguous controls in their intended scope without deleting legitimate repeated links or text. Keep simultaneously available controls independently operable by pointer and keyboard. When adding controls, update their shared layout so their hit areas do not overlap and intercept each other's input. Split large inline CSS/JS out of index.html into real files (frontend/src/styles.css, frontend/src/app.js linked from index.html) and keep every emitted file small enough to re-emit whole - never one oversized page."
 
 # Tiny-spec tier (OCTOS_ARC_TINY_SPEC_CHARS, default 1500; OCTOS_ARC_TINY=0 disables): the prompt is the
 # spec's own statements only, the reply is one HTML file, the server is a fixed harness scaffold (no task
@@ -1103,6 +1106,63 @@ def strip_code_fences(text: str) -> str:
     m = re.search(r"```[a-zA-Z]*\n(.*?)```", text, re.DOTALL)
     return m.group(1).strip() if m else text
 
+
+def derived_routes(text: str, limit: int = 40) -> list[str]:
+    """Pull candidate routes (/path and METHOD /path) out of requirement text.
+
+    Generic and best-effort: template variables are replaced with a literal and
+    results are deduplicated. Probes treat any status < 500 as acceptable, so a
+    route that is only a client-side hash link (server 404) does not fail.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in re.finditer(r"(?:GET|POST|PUT|PATCH|DELETE)\s+/([A-Za-z0-9_\-/{}.:]+)", text, re.IGNORECASE):
+        path = "/" + m.group(1).rstrip("/")
+        path = re.sub(r"\{[^}]*\}", "0", path)
+        if path not in seen:
+            seen.add(path)
+            out.append(path)
+    for m in re.finditer(r"(?<![\w:./-])(/(?:api/)?[A-Za-z0-9_\-]+(?:/[A-Za-z0-9_\-]+){0,5})(?![A-Za-z0-9_\-/])", text):
+        path = m.group(1).rstrip("/") or "/"
+        if path not in seen:
+            seen.add(path)
+            out.append(path)
+    if "/" not in seen:
+        out.insert(0, "/")
+    return out[:limit]
+
+
+def http_status(port: int, path: str, timeout: float = 5.0) -> int | None:
+    """GET /path and return the status; None when the server did not answer."""
+    import http.client
+    conn = None
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        resp.read()
+        return resp.status
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def http_body(port: int, path: str, timeout: float = 5.0) -> str:
+    """GET /path and return the response body (best effort)."""
+    import http.client
+    conn = None
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        return resp.read().decode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        return ""
+    finally:
+        if conn is not None:
+            conn.close()
 
 def compact_spec_lines(text: str) -> str:
     """The spec's statements without imports, blank lines, `await` and closing
@@ -1238,7 +1298,7 @@ FINAL_CHECK_PROMPT = """\
 Final end-to-end check of the web application in the current directory:
 1. `npm run build` in frontend/ — fix any error.
 2. Kill leftover servers, start the backend with `ARC_EXTRA_PORTS=0 PORT={smoke} npm start`, confirm `curl http://127.0.0.1:{smoke}/` serves the app and every API endpoint answers (success and error cases).
-3. Audit required flows and states against the contracts below. Check accessible names, unique IDs and correct label associations. Resolve observed locator ambiguity in its intended scope; repeated text and destinations can be legitimate.
+3. Audit required flows and states against the contracts below. Check accessible names, unique IDs and correct label associations. Resolve observed locator ambiguity in its intended scope; repeated text and destinations can be legitimate. Also verify navigation: clicking every visible in-app link must render the destination view (hash-routed links need a hashchange/popstate listener or a navigation handler on each link) - never leave the old view on screen while the URL changes.
 {tests}
 {ui}{performance}
 """ + PORT_RULES
@@ -1952,6 +2012,71 @@ class Flow:
         if proxy is not None and self.context_managed_drop_shell():
             proxy.extra_drop_tools = set(self.SHELL_TOOLS) if minimal else set()
         return VERIFY_MINIMAL if minimal else VERIFY_FULL.format(smoke=self.smoke_port)
+    def static_navigation_check(self) -> list[str]:
+        """Generic SPA sanity: hash-routed links must re-render on click.
+
+        Scans the workspace for pages that contain href="#/... links but no
+        hashchange/popstate listener and no onclick navigation handler on those
+        links. Such links change the URL while the old view stays on screen,
+        which makes every link-driven flow fail. Task-agnostic: it only reports
+        a defect when hash navigation exists without a re-render mechanism.
+        """
+        root = self.output_dir
+        pages = []
+        src_dir = root / "frontend" / "src"
+        dist_dir = root / "frontend" / "dist"
+        if src_dir.is_dir():
+            pages.extend(src_dir.rglob("*.html"))
+        elif dist_dir.is_dir():
+            pages.extend(dist_dir.rglob("*.html"))
+        if not pages:
+            pages = [
+                p
+                for p in root.rglob("*.html")
+                if not any(part in {"node_modules", ".git", ".arc", "__pycache__", "dist"} for part in p.parts)
+            ]
+        defects = []
+        seen = set()
+        for page in pages:
+            try:
+                text = page.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            links = re.findall(r'href\s*=\s*["\']#[^"\']*["\']', text)
+            links = [lnk for lnk in links if lnk.rstrip().rstrip("'\"") != 'href="#"']
+            if not links:
+                continue
+            scripts = [text]
+            for m in re.finditer(r'<script[^>]*src\s*=\s*["\']([^"\']+)["\']', text, re.IGNORECASE):
+                src = m.group(1)
+                if src.startswith(("http:", "https:", "//")):
+                    continue
+                cand = (page.parent / src.split("?", 1)[0]).resolve()
+                try:
+                    if cand.is_file():
+                        scripts.append(cand.read_text(encoding="utf-8", errors="replace"))
+                except OSError:
+                    continue
+            blob = "\n".join(scripts)
+            has_listener = "hashchange" in blob or "popstate" in blob
+            # only pages that perform client-side routing count (a plain page with a
+            # stray hash link is not the SPA navigation defect we gate on)
+            routes = "function render(" in blob or "render()" in blob or "navigate(" in blob
+            unhandled = [lnk for lnk in links if "onclick" not in lnk]
+            if has_listener or not routes or not unhandled:
+                continue
+            rel = page.relative_to(root).as_posix()
+            if rel in seen:
+                continue
+            seen.add(rel)
+            sample = ", ".join(unhandled[:3])
+            defects.append(
+                f"{rel}: {len(unhandled)} hash link(s) ({sample}) have no re-render "
+                f"handler and no hashchange/popstate listener - clicking them changes "
+                f"the URL but keeps the old view"
+            )
+        return defects
+
 
     def codegen_mode(self) -> bool:
         """One-request generation per node (OCTOS_ARC_CODEGEN=0 disables; OCTOS_ARC_CODEGEN_MAX_NODES caps the
@@ -2109,6 +2234,22 @@ class Flow:
             deduped = dedupe_nav_links(self.output_dir)
             if deduped:
                 log(f"[codegen] {label}: removed static nav links duplicating the NAV placeholder in {deduped}")
+            max_file_chars = int(os.environ.get("OCTOS_ARC_CODEGEN_MAX_FILE_CHARS", "60000"))
+            big = sorted((rel, len(files[rel])) for rel in files if len(files[rel]) > max_file_chars)
+            if big:
+                # Bug C: one giant index.html per node blew the output budget and
+                # made repairs impossible. Switch this node's remaining turns to
+                # tool mode so the model edits incrementally instead of re-emitting
+                # the whole page, and tell it to split CSS/JS into real files.
+                self.codegen_blocked = True
+                names = ", ".join(f"{rel} ({chars} chars)" for rel, chars in big)
+                self.pending_corrections.append(
+                    f"The previous response produced very large single-file output ({names}). This node's "
+                    "repairs now use tool mode: edit existing files incrementally, split inline CSS/JS out "
+                    "of index.html into frontend/src/styles.css and frontend/src/app.js (linked from "
+                    "index.html), and never re-emit the whole page in one response."
+                )
+                log(f"[codegen] {label}: oversized output ({names}); repairs switched to tool mode")
             return True, text
         if ok:
             log(f"[codegen] {label}: reply contained no file blocks")
@@ -2456,14 +2597,78 @@ class Flow:
         return not (any(v is True for v in getattr(self, "test_verdict", {}).values())
                     or any(r.passed > 0 for r in getattr(self, "probe_summaries", {}).values()))
 
+    def fallback_verify(self, node_id: str) -> bool | None:
+        """Requirement-derived smoke/contract verification for a node with no
+        acceptance specs (previously a silent skip -> zero repair per node).
+
+        Build + start the app exactly like the grader, then require: the app
+        builds/starts, GET /api/health answers 2xx/3xx, unknown paths do not
+        crash the server, and every route referenced by the requirement answers
+        with a status below 500. Landmark/aria presence is logged as a warning
+        only, so tiny tasks without specs are never failed on it.
+        """
+        if self.runner is None:
+            return None
+        node = self.requirement_nodes.get(node_id) or {}
+        try:
+            text = "\n".join(
+                [str(node.get("description") or "")]
+                + [st.get("content", "") for sc in node.get("scenarios") or []
+                   for st in (sc.get("steps") if isinstance(sc, dict) else []) or []]
+            )
+        except Exception:  # noqa: BLE001
+            text = str(node.get("description") or "")
+        routes = derived_routes(text)
+        log(f"[fallback-verify] {node_id}: no acceptance specs; derived smoke routes={routes}")
+        server = AppServer(self.output_dir, self.smoke_port, log)
+        try:
+            error = server.build() or server.start()
+        except Exception as exc:  # noqa: BLE001
+            error = f"build/start raised {exc.__class__.__name__}: {exc}"
+        if error:
+            server.stop()
+            log(f"[fallback-verify] {node_id} FAILED: {error[:400]}")
+            return False
+        failures: list[str] = []
+        try:
+            err = health_probe(self.smoke_port, server.proc)
+            if err:
+                failures.append(err)
+            err = robustness_probe(self.smoke_port, server.proc)
+            if err:
+                failures.append(err)
+            for route in routes:
+                status = http_status(self.smoke_port, route)
+                if status is None:
+                    failures.append(f"GET {route}: no HTTP response")
+                elif status >= 500:
+                    failures.append(f"GET {route}: HTTP {status} (>= 500)")
+            home = http_body(self.smoke_port, "/")
+            landmarks = ("<main", "<nav", "<header", 'role="main"', 'role="navigation"', "aria-label")
+            if home and not any(tag in home.lower() for tag in landmarks):
+                log(f"[fallback-verify] {node_id}: WARNING / serves no <main>/<nav>/<header>/aria landmarks")
+        finally:
+            server.stop()
+        if failures:
+            for f in failures:
+                log(f"[fallback-verify] {node_id} FAILED: {f}")
+            return False
+        log(f"[fallback-verify] {node_id} PASSED (build/start/health/robustness/{len(routes)} route(s))")
+        return True
+
     def acceptance_loop(self, node_id: str, specs: list[str], deadline: float,
                         rebuild_prompt=None) -> bool | None:
         """Returns True/False for a real verdict, None when no local run happened.
         `rebuild_prompt(failures)` (optional) yields a full re-implementation
         prompt; it is used only before any behavior has passed verification.
         A failing extension is repaired without replacing working features."""
-        if self.runner is None or not specs:
+        if self.runner is None:
             return None
+        if not specs:
+            # Bug B: a node with no acceptance specs (hackathon trees) used to be
+            # silently skipped -> zero verification and zero repair. Verify the
+            # requirement-derived contract instead (build/start/health/routes).
+            return self.fallback_verify(node_id)
         if self.repair_loop_orchestrator_enabled:
             try:
                 return self.acceptance_loop_orchestrated(node_id, specs, deadline, rebuild_prompt)
@@ -2758,6 +2963,37 @@ class Flow:
         except Exception as exc:  # noqa: BLE001
             log(f"[trace] design not recorded: {exc}")
 
+    def node_budget_for(self, node_id: str, specs: list[str], ordered: list[dict],
+                        index: int, total: int) -> float:
+        """Spec-weighted node budget with a global reserve for the final phases.
+
+        The old equal split gave every node the same time, so the node carrying
+        most of the specs was as starved as a leaf, and at ~282 s per node a
+        fixed 300 s repair floor made repair rounds structurally impossible.
+        Weights use +1 Laplace smoothing so spec-less nodes keep a real floor
+        instead of zero; no node drops below half an equal share; and 25% of
+        the run is reserved for the final integration rehearsal (full-suite
+        passes, final check, startup rehearsal) so those phases cannot be eaten
+        by the node loop.
+        """
+        reserve = float(os.environ.get("OCTOS_ARC_FINAL_RESERVE_FRACTION", "0.25"))
+        available = max(0.0, self.remaining() * (1.0 - reserve))
+        nodes_left = total - index + 1
+        equal_share = available / max(1, nodes_left)
+        counts = [len(self.spec_map.get(str(n.get("id")), []) or []) for n in ordered[index - 1:]]
+        total_weight = sum(counts) + len(counts) or 1
+        weight = (len(specs) + 1.0) / total_weight
+        budget = max(available * weight, equal_share * 0.5)
+        return min(self.node_budget_cap, max(240.0, budget))
+
+    def repair_floor_for(self, budget: float) -> int:
+        """Adaptive repair floor: scale the minimum seconds a repair round
+        needs to the node's budget. A fixed 300 s floor made repairs impossible
+        at small per-node budgets; the floor now shrinks with the budget but
+        never below 120 s."""
+        base = int(os.environ.get("OCTOS_MIN_REPAIR_SECONDS", "300"))
+        return int(max(120, min(base, budget * 0.35)))
+
     def node_cycle(self, node: dict, ordered: list[dict], index: int, total: int) -> None:
         node_id = str(node.get("id"))
         analysis_digest = self.analysis_digest_for(node_id)
@@ -2765,9 +3001,9 @@ class Flow:
         self.codegen_blocked = False  # a previous node's fallback to tool mode must not leak into this one
         if index > 1:
             reap_workspace_processes(self.output_dir, log)
-        nodes_left = total - index + 1
-        node_budget = min(self.node_budget_cap, max(240, self.remaining() / nodes_left))
+        node_budget = self.node_budget_for(node_id, specs, ordered, index, total)
         deadline = time.time() + node_budget
+        self.min_repair_seconds = self.repair_floor_for(node_budget)
         log(f"[flow] node {index}/{total} {node_id} starting (budget {node_budget:.0f}s, specs={specs})")
 
         self.mark("design_started", node_id)
@@ -2839,13 +3075,18 @@ class Flow:
                 log(f"[flow] {node_id}: spec or existing source exceeds one-request allowance ({len(self.spec_bodies(node_id))} spec chars); tool mode")
             ok, text = self.turn(prompt, implement_timeout, f"{node_id} implement")
         if not ok and "truncated" in text.lower():
-            # Cloud 76fb32a69d81: output cut by max_tokens, nothing written. Retry
-            # once, one file per response (fresh session, same prompt).
-            log(f"[flow] {node_id}: output truncated; retrying with one file per response")
+            # Cloud 76fb32a69d81: output cut by max_tokens, nothing written.
+            # Retry once in tool mode (fresh session, same prompt): the model now
+            # edits incrementally instead of re-emitting whole files, and this
+            # node's later repair rounds stay in tool mode too.
+            self.codegen_blocked = True
+            log(f"[flow] {node_id}: output truncated; retrying in tool mode with incremental edits")
             self.driver.close()
             retry = prompt + ("\nYOUR PREVIOUS RESPONSE WAS TRUNCATED BY THE OUTPUT LIMIT AND NOTHING WAS SAVED. "
-                              "Write exactly ONE file per response (one write_file call, complete file), "
-                              "starting with backend/server.js, then finish.\n")
+                              "Edit the existing files incrementally in small steps; never re-emit a whole "
+                              "page in one response. Split inline CSS/JS out of index.html into "
+                              "frontend/src/styles.css and frontend/src/app.js (linked from index.html). "
+                              "Start with backend/server.js, then finish.\n")
             ok, text = self.turn(retry, min(self.node_timeout, deadline - time.time()), f"{node_id} implement (retry)")
         timed_out = (not ok) and "timed out" in text.lower()
         if ok and not self.has_app():
@@ -2908,7 +3149,9 @@ class Flow:
         ]
         self.test_verdict[node_id] = verdict
         if verdict is True:
-            self.mark("test_passed", node_id, f"{len(specs)} acceptance spec file(s) pass locally")
+            label = (f"{len(specs)} acceptance spec file(s) pass locally" if specs
+                     else "requirement-derived fallback verification passed")
+            self.mark("test_passed", node_id, label)
             try:
                 for iface in self.runtime.traceability.list_interfaces(req_id=node_id):
                     self.runtime.traceability.set_interface_implemented(iface["interface_id"], True, emit_event=False)
@@ -2993,20 +3236,24 @@ class Flow:
         self.mark("implementation_started", node_id)
         self.mark("implementation_done", node_id, "carried over from the template application")
         verdict = None
-        if self.runner is not None and specs:
-            summary = self.probe_summaries.pop(node_id, None) or self.run_specs(specs)
-            if summary.error:
-                log(f"[acceptance] regression {node_id} infrastructure error: {summary.error[:300]}")
+        if self.runner is not None:
+            if not specs:
+                verdict = self.fallback_verify(node_id)
             else:
-                self.record_tests(node_id, specs, summary)
-                verdict = summary.all_passed
-                log(f"[acceptance] regression {node_id}: {summary.passed}/{summary.total}")
-                if not verdict:
-                    deadline = time.time() + min(self.node_budget_cap, max(240, self.remaining() / 2))
-                    self.pending_corrections.append(
-                        "This node passed before this evolution round; the regression below must be fixed "
-                        "without removing the new behaviour.")
-                    verdict = self.acceptance_loop(node_id, specs, deadline)
+                summary = self.probe_summaries.pop(node_id, None) or self.run_specs(specs)
+                if summary.error:
+                    log(f"[acceptance] regression {node_id} infrastructure error: {summary.error[:300]}")
+                else:
+                    self.record_tests(node_id, specs, summary)
+                    verdict = summary.all_passed
+                    log(f"[acceptance] regression {node_id}: {summary.passed}/{summary.total}")
+                    if not verdict:
+                        deadline = time.time() + min(self.node_budget_cap, max(240, self.remaining() / 2))
+                        self.min_repair_seconds = self.repair_floor_for(deadline - time.time())
+                        self.pending_corrections.append(
+                            "This node passed before this evolution round; the regression below must be fixed "
+                            "without removing the new behaviour.")
+                        verdict = self.acceptance_loop(node_id, specs, deadline)
         self.test_verdict[node_id] = verdict
         if verdict is True:
             self.mark("test_passed", node_id, "regression specs pass locally")
@@ -3631,7 +3878,7 @@ class Flow:
             self.tests_dir = locate_acceptance_tests(tree, BUNDLE_DIR)
             if self.tests_dir:
                 specs = sorted(str(p.relative_to(self.tests_dir)) for p in self.tests_dir.rglob("*.spec.ts"))
-                self.spec_map, self.aliases = map_specs_to_nodes(specs, node_ids)
+                self.spec_map, self.aliases = map_specs_to_nodes(specs, node_ids, log)
                 log(f"[tests] {len(specs)} spec files at {self.tests_dir}; mapping "
                     f"{ {k: v for k, v in self.spec_map.items() if v} }; aliases {self.aliases}")
             else:
@@ -3705,6 +3952,9 @@ class Flow:
                     self.regression_checkpoint(index, len(ordered))
                     self.driver.end_scope("node")
 
+                # Back to the base floor: the node loop's per-node adaptive floor
+                # must not shrink the global final-phase protection.
+                self.min_repair_seconds = int(os.environ.get("OCTOS_MIN_REPAIR_SECONDS", "300"))
                 self.final_acceptance_passes()
                 undecided = [i for i in node_ids if self.test_verdict.get(i) is None and i not in self.impl_failed]
                 final_ok = None
@@ -3713,7 +3963,15 @@ class Flow:
                     regression_plan = self.regression_execution_text(undecided)
                     if regression_plan:
                         log("[regression-exec] generic regression plan injected into the final check")
-                    final_ok, _ = self.turn(regression_plan + FINAL_CHECK_PROMPT.format(smoke=self.smoke_port, port=self.web_port,
+                    nav_defects = self.static_navigation_check()
+                    if nav_defects:
+                        log("[nav-sanity] hash links without a re-render handler:\n" + "\n".join("- " + d for d in nav_defects))
+                        nav_block = "STATIC NAVIGATION DEFECTS TO FIX FIRST:\n" + \
+                            "\n".join("- " + d for d in nav_defects) + \
+                            "\nFix these first: every hash link click must render the destination view (add a hashchange/popstate listener or a navigation handler on each link), then re-run the checks.\n"
+                    else:
+                        nav_block = ""
+                    final_ok, _ = self.turn(regression_plan + nav_block + FINAL_CHECK_PROMPT.format(smoke=self.smoke_port, port=self.web_port,
                                                                       tests=self.tests_prompt_for(None),
                                                                       performance=self.perf_text(), ui=self.ui_contract()),
                                             self.node_timeout, "final check")
