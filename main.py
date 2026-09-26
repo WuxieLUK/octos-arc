@@ -27,10 +27,10 @@ Environment (all optional):
     OCTOS_BIN                 octos binary (default: ./bin/octos, PATH, download)
     OCTOS_NODE_TIMEOUT        seconds per model turn (default 1200)
     OCTOS_TIME_BUDGET         seconds for the whole generation (default max(3600, 1500 x nodes))
-    OCTOS_SECONDS_PER_NODE    per-node allowance used for that default (1500)
+    OCTOS_SECONDS_PER_NODE    per-node allowance used for that default (2400)
     OCTOS_MIN_REPAIR_SECONDS  do not start a repair turn with less than this left (300)
-    OCTOS_NODE_TIME_BUDGET    cap per node incl. repairs (default 1500)
-    OCTOS_REPAIR_ROUNDS       K, acceptance repair rounds per node (default 5)
+    OCTOS_NODE_TIME_BUDGET    cap per node incl. repairs (default 2400)
+    OCTOS_REPAIR_ROUNDS       K, acceptance repair rounds per node (default 5; retained for large trees)
     OCTOS_DESIGN_TURN         "0" disables the design turn
     OCTOS_DESIGN_MODE         inline (default) | separate (own read-only design turn)
     OCTOS_DESIGN_MIN_NODES    design only for trees with at least this many nodes (3)
@@ -68,7 +68,7 @@ Environment (all optional):
     OCTOS_ARC_FAILURE_ANALYZER "0" disables shadow failure-analyzer manifests
                                   (default enabled; writes .arc/analysis/<node>.failure-analyzer.json)
     OCTOS_ARC_FAILURE_ANALYSIS "0" disables the generic failure analysis in repair prompts
-                                  (default disabled)
+                                  (default enabled for score-first runs)
     OCTOS_ARC_REPAIR_LOOP  "0" disables shadow repair-loop manifests
                                   (default enabled; writes .arc/analysis/<node>.repair-loop.json)
     OCTOS_ARC_REPAIR_LOOP_EXECUTION "1" injects the generic repair-loop policy and stable-failure threshold
@@ -77,8 +77,8 @@ Environment (all optional):
                                   (default disabled; falls back to the existing loop on error)
     OCTOS_ARC_REGRESSION_VERIFIER "0" disables shadow regression-verifier manifests
                                   (default enabled; writes .arc/analysis/<node>.regression-verifier.json)
-    OCTOS_ARC_REGRESSION_EXECUTION "1" injects a generic regression verification plan into final checks
-                                  (default disabled)
+    OCTOS_ARC_REGRESSION_EXECUTION "0" disables the generic regression verification plan in final checks
+                                  (default enabled for score-first runs)
     OCTOS_ARC_REGRESSION_ORCHESTRATOR "1" injects generic regression plans into checkpoint repair context
                                   (default disabled; never narrows the official test set)
     OCTOS_ARC_FINAL_VERIFICATION "0" disables shadow final-verification manifests
@@ -126,7 +126,7 @@ from acceptance import (  # noqa: E402
     failure_signature, failure_summaries, failure_source_context, find_playwright_by_search, find_playwright_root, map_specs_to_nodes,
     nodes_for_failures, playwright_candidates, playwright_version_hint, restore_tree,
     mutated_by_tests, restore_worktree, snapshot_worktree, tree_digest, workers_for_final, reap_workspace_processes,
-    health_probe, robustness_probe)
+    health_probe, robustness_probe, acceptance_files, is_acceptance_file)
 from codegen import FORMAT_INSTRUCTIONS, dedupe_nav_links, parse_file_blocks, write_files  # noqa: E402
 from analysis_pipeline import build_analysis_digest, build_pipeline_artifacts, write_pipeline_reports  # noqa: E402
 from constraint_boundary_analyzer import write_constraint_analyses  # noqa: E402
@@ -1312,6 +1312,10 @@ VERIFY_FULL = """\
 Verify briefly before you finish — the harness runs the official acceptance tests for this node right after your turn and hands you the failures, so do not build your own test suite: `npm run build` in frontend/, start the backend with `ARC_EXTRA_PORTS=0 PORT={smoke} npm start`, one curl per new endpoint (one success, one error case), stop the server.
 """
 
+VERIFY_REQUIREMENTS_ONLY = """\
+There are no public acceptance specs for this task. Treat the requirement scenarios as the test oracle, not as documentation to defer. Before finishing this turn, exercise the node's visible flow against the running app (use the installed browser/Playwright or a small HTTP client as appropriate): start from the stated entry page, use the exact accessible labels and action order from the scenarios, verify the resulting text/state, reload to verify persistence, and try at least one invalid/permission case when the requirement specifies one. Audit the shared header/session/navigation after the flow. Do not claim a feature is implemented merely because the server starts or an endpoint returns 200; leave the app in a state that an external browser test can actually drive.
+"""
+
 VERIFY_MINIMAL = """\
 You have no shell in this turn. The harness runs `npm run build`, starts the backend and runs the official Playwright specs after your turn, then supplies any failures. Work within the configured request and output budgets. Preserve the existing application structure and create or edit the files needed by the requirements; do not combine unrelated modules merely to reduce file count. Use the supplied file listing and source evidence first, and inspect additional files when needed to resolve uncertainty. Batch independent small edits where practical, split changes that would exceed the response budget, and avoid rereading unchanged files without a reason. Check syntax and imports before finishing, then give a brief summary.
 """
@@ -1327,11 +1331,11 @@ Set the shell tool workdir to the application directory and run this command unc
 """
 
 SKELETON_PROMPT = """\
-Build the skeleton of a full-stack web application in the current working directory. The requirement tree is at {req_dir} (skim it; individual features come in later turns).
+Build the skeleton of a full-stack web application in the current working directory. The requirement tree is at {req_dir}. Read the entire requirement tree before coding: identify shared entities, authentication/session rules, persistence boundaries, permissions, major pages, and the cross-feature flows that later nodes will extend. Create an extensible foundation rather than a throwaway page for the first feature.
 
 """ + ARCHITECTURE_CONTRACT + """
 {tests}
-Steps: create frontend/ and backend/ as specified with a home page and a GET /api/health endpoint that returns 2xx for the grader, seed the JSON store, run `npm run build` in frontend/, start the backend with `ARC_EXTRA_PORTS=0 PORT={smoke} npm start`, `curl http://127.0.0.1:{smoke}/` and `curl http://127.0.0.1:{smoke}/api/health` to confirm the app is ready, then stop it.
+Steps: create frontend/ and backend/ as specified with a shared accessible shell, durable server-side state, session abstraction, route/API structure, a home page and a GET /api/health endpoint that returns 2xx for the grader, and seed only the records explicitly required by the requirements. Keep later feature work additive: do not replace the data model or session path per node. Run `npm run build` in frontend/, start the backend with `ARC_EXTRA_PORTS=0 PORT={smoke} npm start`, exercise the home/auth entry flow plus one representative state-changing flow, curl `http://127.0.0.1:{smoke}/` and `http://127.0.0.1:{smoke}/api/health` to confirm the app is ready, then stop it.
 """ + PORT_RULES
 
 NUDGE_PROMPT = """\
@@ -1408,6 +1412,10 @@ Requirement-derived verification of {node_id} failed ({passed}/{total} checks). 
 Fix frontend/ and/or backend/ so these checks pass without breaking earlier nodes. Classify each failure before editing (build/start, health endpoint, unknown-path crash, missing route, or a hash link no router case handles - a link that changes the URL while the old view stays on screen or falls back to a default view fails every flow that starts from it). Add a hashchange/popstate listener or a navigation handler for every hash link and make /api/health answer 2xx/3xx. The harness rebuilds, restarts and re-runs these checks right after your turn. Preserve behavior beyond the checked routes and keep every emitted file small enough to re-emit whole.
 """ + PORT_RULES
 
+REQUIREMENTS_AUDIT_PROMPT = """\
+The requirement node {node_id} has no public acceptance spec, so a smoke pass is not sufficient evidence. Perform one focused end-to-end audit of this node before it is accepted. Read the requirement scenarios and the existing implementation, then use the running app (browser/Playwright when available, otherwise HTTP plus DOM inspection) to exercise the exact entry page, accessible labels, action order, success state, reload/persistence behavior, and at least one invalid or permission case explicitly described by the requirement. Fix any defect you observe in frontend/ or backend/. Preserve previously working behavior and stop any server you start. Do not just report that the app starts; make the edits and verify the actual user-visible flow.
+""" + PORT_RULES
+
 
 FINAL_CHECK_PROMPT = """\
 Final end-to-end check of the web application in the current directory:
@@ -1428,7 +1436,7 @@ Fix the project so this sequence works (typical causes: a require() path that do
 """
 
 ACCEPTANCE_TESTS_PROMPT = """\
-PUBLIC ACCEPTANCE TESTS (examples to validate the full requirement; report conflicts instead of silently discarding requirements) live under {tests_dir}. Files: {files}. They define routes, hrefs, accessible names, option labels, exact texts, error wording and action order. Never modify, copy or delete them.
+PUBLIC ACCEPTANCE TESTS (the executable contract available for this task) live under {tests_dir}. Files: {files}. Read the relevant specs and helpers before implementing. Match their routes, hrefs, accessible names, option labels, exact texts, error wording, persistence expectations and action order. Never modify, copy or delete the tests. If prose and an available acceptance test appear inconsistent, preserve the broader requirement where possible but report the conflict and satisfy the observable test contract rather than guessing.
 """
 
 INLINE_SPEC_HEADER = """\
@@ -1475,9 +1483,9 @@ def locate_acceptance_tests(tree: dict, bundle_dir: Path) -> Path | None:
             log(f"[tests] manifest unreadable: {exc}")
     for cand in candidates:
         try:
-            if cand.is_dir() and any(cand.rglob("*.spec.ts")):
+            if cand.is_dir() and acceptance_files(cand):
                 return cand.resolve()
-            log(f"[tests] candidate {cand}: {'no *.spec.ts' if cand.is_dir() else 'absent'}")
+            log(f"[tests] candidate {cand}: {'no Playwright test files' if cand.is_dir() else 'absent'}")
         except Exception as exc:  # noqa: BLE001
             log(f"[tests] candidate {cand} unreadable: {exc}")
     return None
@@ -1488,7 +1496,9 @@ def spec_base_ports(tests_dir: Path | None) -> list[int]:
     if not tests_dir:
         return []
     ports: set[int] = set()
-    for path in tests_dir.rglob("*.ts"):
+    for path in tests_dir.rglob("*"):
+        if not path.is_file() or path.suffix.lower() not in {".ts", ".js", ".mjs"}:
+            continue
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -1503,7 +1513,8 @@ def acceptance_tests_prompt(tests_dir: Path | None, web_port: int, smoke_port: i
     if not tests_dir:
         return ""
     if files is None:
-        files = sorted(str(p.relative_to(tests_dir)) for p in tests_dir.rglob("*.ts"))
+        files = sorted(str(p.relative_to(tests_dir)) for p in tests_dir.rglob("*")
+                       if p.is_file() and p.suffix.lower() in {".ts", ".js", ".mjs"})
     text = ACCEPTANCE_TESTS_PROMPT.format(tests_dir=tests_dir, files=", ".join(files[:40]) or "(none)")
     if inline:
         text += inline_spec_text(tests_dir, files, int(os.environ.get("OCTOS_ARC_INLINE_SPEC_CHARS", "24000")))
@@ -1550,9 +1561,9 @@ class Flow:
         self.budget_explicit = bool(os.environ.get("OCTOS_TIME_BUDGET"))
         # keep-local-3 (workflow C): with 480 s/node, 16 of 17 implement/repair
         # turns were cut at 283 s; Web nodes need 10-20 min of implementation.
-        self.seconds_per_node = int(os.environ.get("OCTOS_SECONDS_PER_NODE", "1500"))
+        self.seconds_per_node = int(os.environ.get("OCTOS_SECONDS_PER_NODE", "2400"))
         self.min_repair_seconds = int(os.environ.get("OCTOS_MIN_REPAIR_SECONDS", "300"))
-        self.node_budget_cap = int(os.environ.get("OCTOS_NODE_TIME_BUDGET", "1500"))
+        self.node_budget_cap = int(os.environ.get("OCTOS_NODE_TIME_BUDGET", "2400"))
         self.repair_rounds = int(os.environ.get("OCTOS_REPAIR_ROUNDS", "5"))
         self.repair_rounds_explicit = bool(os.environ.get("OCTOS_REPAIR_ROUNDS"))
         # Run-wide cost guard. Defaults scale with the tree and sit ~3x above a normal run
@@ -1583,7 +1594,7 @@ class Flow:
         self.repair_loop_orchestrator_enabled = os.environ.get("OCTOS_ARC_REPAIR_LOOP_ORCHESTRATOR", "0") != "0"
         self.repair_decision_enabled = os.environ.get("OCTOS_ARC_REPAIR_DECISION", "0") != "0"
         self.repair_decisions = {"REPAIR": 0, "RETRY_VERIFY": 0, "STOP_NO_PROGRESS": 0}
-        self.regression_execution_enabled = os.environ.get("OCTOS_ARC_REGRESSION_EXECUTION", "0") != "0"
+        self.regression_execution_enabled = os.environ.get("OCTOS_ARC_REGRESSION_EXECUTION", "1") != "0"
         self.regression_orchestrator_enabled = os.environ.get("OCTOS_ARC_REGRESSION_ORCHESTRATOR", "0") != "0"
         self.test_runner_execution_enabled = os.environ.get("OCTOS_ARC_TEST_RUNNER_EXECUTION", "0") != "0"
         self.environment_report = None
@@ -1883,7 +1894,7 @@ class Flow:
 
     def failure_analysis_text(self, node_id: str, summary: RunSummary, failures: str) -> str:
         """Return opt-in, task-agnostic failure analysis for a repair prompt."""
-        if os.environ.get("OCTOS_ARC_FAILURE_ANALYSIS", "0") == "0":
+        if os.environ.get("OCTOS_ARC_FAILURE_ANALYSIS", "1") == "0":
             return ""
         try:
             result = self.test_run_result_from_summary(summary, failures)
@@ -2111,7 +2122,20 @@ class Flow:
         return "\n".join(blocks) + "\n"
 
     def node_spec(self, node: dict) -> str:
-        return describe_node(node) + self.visual_ref_text(str(node.get("id")))
+        text = describe_node(node)
+        # Multi-scope requirement trees often keep product-wide invariants
+        # (seed data, session isolation, persistence and permissions) on the
+        # FOLDER root.  With no public specs the implementation turn otherwise
+        # sees only one leaf and can violate those invariants while still
+        # satisfying its local smoke checks. Carry the compact root contract
+        # into every leaf prompt; omit it when the requirement tree is absent.
+        if not self.tests_dir:
+            root = getattr(self, "requirement_root", None)
+            root_text = str((root or {}).get("description") or "").strip()
+            if root_text and root_text != str(node.get("description") or "").strip():
+                text = ("Global product contract (applies to every requirement; preserve it):\n"
+                        + root_text + "\n\n" + text)
+        return text + self.visual_ref_text(str(node.get("id")))
 
     SHELL_TOOLS = {"bash", "shell", "exec_command"}
 
@@ -2127,6 +2151,8 @@ class Flow:
         proxy = getattr(self, "llm_proxy", None)
         if proxy is not None and self.context_managed_drop_shell():
             proxy.extra_drop_tools = set(self.SHELL_TOOLS) if minimal else set()
+        if not self.tests_dir:
+            return (VERIFY_REQUIREMENTS_ONLY + PORT_RULES).format(smoke=self.smoke_port, port=self.web_port)
         return VERIFY_MINIMAL if minimal else VERIFY_FULL.format(smoke=self.smoke_port)
     def static_navigation_check(self) -> list[str]:
         """Generic SPA sanity: hash-routed links must re-render on click.
@@ -2213,7 +2239,8 @@ class Flow:
                 continue
             specs = _route_specs_from_js(blob)
             paths = [m.group(1).split("?", 1)[0] for lnk in unhandled
-                     for m in [re.search(r'#([^"\']*)', lnk)] if m]
+                     for m in [re.search(r'#([^"\']*)', lnk)] if m
+                     and "${" not in m.group(1) and not m.group(1).startswith("$")]
             if unhandled:
                 missing = [p for p in paths if p not in ("", "/") and not _route_handled(specs, p)]
                 if missing:
@@ -2431,8 +2458,9 @@ class Flow:
         if not self.tests_dir:
             return "(none)"
         files = list(self.spec_map.get(node_id) or [])
-        files += sorted(str(p.relative_to(self.tests_dir)) for p in self.tests_dir.rglob("*.ts")
-                        if not p.name.endswith(".spec.ts") and str(p.relative_to(self.tests_dir)) not in files)
+        files += sorted(str(p.relative_to(self.tests_dir)) for p in self.tests_dir.rglob("*")
+                        if p.is_file() and p.suffix.lower() in {".ts", ".js", ".mjs"}
+                        and not is_acceptance_file(p) and str(p.relative_to(self.tests_dir)) not in files)
         parts = []
         for rel in files:
             try:
@@ -2485,19 +2513,21 @@ class Flow:
         if not self.tests_dir:
             return ""
         if skeleton:
-            support = sorted(str(p.relative_to(self.tests_dir)) for p in self.tests_dir.rglob("*.ts")
-                             if not p.name.endswith(".spec.ts"))
-            n_specs = len(list(self.tests_dir.rglob("*.spec.ts")))
+            support = sorted(str(p.relative_to(self.tests_dir)) for p in self.tests_dir.rglob("*")
+                             if p.is_file() and p.suffix.lower() in {".ts", ".js", ".mjs"}
+                             and not is_acceptance_file(p))
+            n_specs = len(acceptance_files(self.tests_dir))
             return (f"The official Playwright specs ({n_specs} files) live under {self.tests_dir}; each later turn "
                     f"receives the spec files for its own node. In THIS turn read only the shared helpers "
                     f"({', '.join(support[:10]) or 'none'}) and at most two spec files to learn the base URL, "
                     f"navigation and header conventions; do not implement the features yet.\n"
                     + acceptance_tests_prompt(self.tests_dir, self.web_port, self.smoke_port, []).split("\n", 1)[-1])
         files = list(self.spec_map.get(node_id) or [])
-        support = sorted(str(p.relative_to(self.tests_dir)) for p in self.tests_dir.rglob("*.ts")
-                         if not p.name.endswith(".spec.ts"))
+        support = sorted(str(p.relative_to(self.tests_dir)) for p in self.tests_dir.rglob("*")
+                         if p.is_file() and p.suffix.lower() in {".ts", ".js", ".mjs"}
+                         and not is_acceptance_file(p))
         if not files:  # node without its own spec: show everything
-            files = sorted(str(p.relative_to(self.tests_dir)) for p in self.tests_dir.rglob("*.spec.ts"))
+            files = sorted(str(p.relative_to(self.tests_dir)) for p in acceptance_files(self.tests_dir))
         return acceptance_tests_prompt(self.tests_dir, self.web_port, self.smoke_port, files + support,
                                        inline=os.environ.get("OCTOS_ARC_INLINE_SPECS", "1") != "0")
 
@@ -2807,6 +2837,18 @@ class Flow:
                     failures.append(f"GET {route}: no HTTP response")
                 elif status >= 500:
                     failures.append(f"GET {route}: HTTP {status} (>= 500)")
+            # A no-spec task still has a concrete page surface. Verify every
+            # source HTML entrypoint is reachable, rather than checking only
+            # `/`; hidden browser tests commonly start on a dedicated page.
+            src_root = self.output_dir / "frontend" / "src"
+            if src_root.is_dir():
+                for page in sorted(src_root.rglob("*.html")):
+                    rel = page.relative_to(src_root).as_posix()
+                    status = http_status(self.smoke_port, "/" + rel)
+                    if status is None:
+                        failures.append(f"GET /{rel}: no HTTP response")
+                    elif status >= 500:
+                        failures.append(f"GET /{rel}: HTTP {status} (>= 500)")
             home = http_body(self.smoke_port, "/")
             landmarks = ("<main", "<nav", "<header", 'role="main"', 'role="navigation"', "aria-label")
             if home and not any(tag in home.lower() for tag in landmarks):
@@ -2816,6 +2858,14 @@ class Flow:
         nav_defects = self.static_navigation_check()
         if nav_defects:
             failures.append("Static navigation: " + " | ".join(nav_defects))
+        # A no-spec smoke can prove that a server is alive while the leaf's
+        # actual contract is absent from the rendered app.  Check the exact
+        # quoted UI names/messages in the requirement against the source tree
+        # and feed a bounded set of misses into the repair loop.  This is a
+        # deliberately conservative lexical check: dynamic values, URLs and
+        # prose fragments are ignored, while labels such as “Create account”,
+        # “Verification code” and required error messages are actionable.
+        failures.extend(self.requirement_contract_defects(node_id))
         if failures:
             self.fallback_failures[node_id] = failures
             for f in failures:
@@ -2824,6 +2874,62 @@ class Flow:
         self.fallback_failures.pop(node_id, None)
         log(f"[fallback-verify] {node_id} PASSED (build/start/health/robustness/{len(routes)} route(s))")
         return True
+
+    def requirement_contract_defects(self, node_id: str, limit: int = 10) -> list[str]:
+        """Return conservative lexical misses for a no-spec requirement.
+
+        Hidden ARC tests rely heavily on exact accessible names and visible
+        error text.  Without public specs the previous fallback accepted any
+        app that started, so a model could leave the supplied page untouched.
+        We inspect quoted phrases from the leaf description/scenarios and look
+        for them in frontend/backend sources.  This is not a replacement for
+        browser tests; it is a cheap signal that causes a repair turn before a
+        node is marked accepted.  Dynamic examples/placeholders and URLs are
+        intentionally excluded to avoid forcing seed data into markup.
+        """
+        node = self.requirement_nodes.get(node_id) or {}
+        chunks = [str(node.get("description") or "")]
+        for scenario in node.get("scenarios") or []:
+            if isinstance(scenario, dict):
+                for step in scenario.get("steps") or []:
+                    if isinstance(step, dict):
+                        chunks.append(str(step.get("content") or ""))
+        text = "\n".join(chunks)
+        phrases: list[str] = []
+        # Requirements use both straight and typographic quotes.  Keep the
+        # interior bounded so a long quoted sentence cannot dominate a prompt.
+        for match in re.finditer(r'["“]([^"”\\\n]{2,90})["”]', text):
+            phrase = re.sub(r"\s+", " ", match.group(1)).strip()
+            low = phrase.lower()
+            if (len(phrase) < 3 or "<" in phrase or ">" in phrase or
+                    "/" in phrase or "@" in phrase or "\\" in phrase or
+                    low in {"get", "post", "put", "delete", "true", "false"}):
+                continue
+            # Require a likely UI token: a multiword phrase, a capitalized
+            # label, or a human-readable error sentence.  Bare identifiers and
+            # arbitrary seed values are not useful lexical evidence.
+            if not (" " in phrase or phrase[:1].isupper() or any(ch in phrase for ch in "?!:")):
+                continue
+            if phrase not in phrases:
+                phrases.append(phrase)
+        if not phrases:
+            return []
+        blobs: list[str] = []
+        for path in app_source_files(self.output_dir):
+            try:
+                blobs.append(path.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                continue
+        source = "\n".join(blobs).lower()
+        misses = [p for p in phrases if p.lower() not in source]
+        if not misses:
+            return []
+        # Preserve requirement order (usually page -> actions -> errors) and
+        # cap the list so one verbose node does not consume the whole repair
+        # prompt.  The first misses are generally the entry-page controls.
+        return [f"Requirement UI contract phrase is absent from app sources: {p!r}; "
+                "implement the corresponding visible control/state (do not merely add hidden text)."
+                for p in misses[:limit]]
 
     def acceptance_loop(self, node_id: str, specs: list[str], deadline: float,
                         rebuild_prompt=None) -> bool | None:
@@ -3000,9 +3106,23 @@ class Flow:
         ~0-2/100).
         """
         self.codegen_blocked = False
+        audited = False
         for attempt in range(self.repair_rounds + 1):
             verdict = self.fallback_verify(node_id)
             if verdict is True:
+                if not self.tests_dir and not audited:
+                    left = deadline - time.time()
+                    if left >= self.min_repair_seconds:
+                        audited = True
+                        prompt = REQUIREMENTS_AUDIT_PROMPT.format(
+                            node_id=node_id,
+                            smoke=self.smoke_port,
+                            port=self.web_port,
+                        ) + self.repair_requirements(node_id)
+                        self.turn(prompt, min(self.node_timeout, left),
+                                  f"{node_id} requirements audit")
+                        self.commit(f"{node_id}: requirements audit")
+                        continue
                 self.commit(f"{node_id} (accepted): fallback verification passes")
                 return True
             if verdict is None:
@@ -3039,7 +3159,7 @@ class Flow:
         """
         all_specs = list(specs)
         if self.tests_dir:
-            all_specs = sorted(str(p.relative_to(self.tests_dir)) for p in self.tests_dir.rglob("*.spec.ts"))
+            all_specs = sorted(str(p.relative_to(self.tests_dir)) for p in acceptance_files(self.tests_dir))
         best_passed, best_sha, regressions = -1, self.head(), 0
         current_summary: RunSummary | None = None
 
@@ -3596,7 +3716,7 @@ class Flow:
         state; this pass can, and it repairs the nodes whose tests fail."""
         if self.runner is None or not self.tests_dir:
             return
-        all_specs = sorted(str(p.relative_to(self.tests_dir)) for p in self.tests_dir.rglob("*.spec.ts"))
+        all_specs = sorted(str(p.relative_to(self.tests_dir)) for p in acceptance_files(self.tests_dir))
         unverified = [n for n, v in self.test_verdict.items() if v is not True] or \
             [n for n in self.spec_map if n and self.spec_map[n] and n not in self.test_verdict]
         if len(all_specs) < 2 and not unverified:
@@ -3951,6 +4071,11 @@ class Flow:
         try:
             previous = previous_requirement_records(self.output_dir)
             tree = load_requirement_tree(self.req_dir)
+            # Keep the root-level product invariants available to leaf prompts.
+            # They are especially important when the platform provides no
+            # public acceptance specs and each atomic turn is otherwise scoped
+            # too narrowly to notice session/persistence/permission rules.
+            self.requirement_root = tree
             self.runtime.traceability.store_requirement_tree(tree)
             ordered = topo_order(tree)
             self.requirement_nodes = {str(node.get("id")): node for node in ordered}
@@ -3960,7 +4085,11 @@ class Flow:
             node_ids = [str(n.get("id")) for n in ordered]
             if not self.budget_explicit:
                 # 32-node trees need hours, not the 1-hour smoke default.
-                self.budget = max(self.budget, self.seconds_per_node * len(ordered))
+                # The competition permits at most 48 hours per task. Give
+                # requirements-heavy tasks more room for browser audits and
+                # repairs, but never let the adaptive default exceed that
+                # platform limit.
+                self.budget = min(48 * 3600, max(self.budget, self.seconds_per_node * len(ordered)))
             log(f"[flow] {len(ordered)} atomic nodes in dependency order: {node_ids}; time budget {self.budget}s")
             self.folder_children = folder_descendants(tree)
 
@@ -4082,17 +4211,20 @@ class Flow:
             self.nodes_to_implement = len([n for n in node_ids if n not in unchanged])
             self.n_nodes = len(ordered)
             if not self.repair_rounds_explicit and self.n_nodes > 2:
-                self.repair_rounds = 3  # big trees: identical-failure/no-improvement stops make 5 rounds rare anyway
+                # Score-first mode: large trees still get the full repair budget.
+                # The old reduction to three rounds made no-spec tasks accept
+                # after a shallow smoke pass and left hidden UI failures unfixed.
+                self.repair_rounds = 5
             if self.max_total_tokens < 0:
-                self.max_total_tokens = max(6_000_000, 2_500_000 * self.n_nodes)   # ~3x the calibrated 0.8M/node
+                self.max_total_tokens = max(10_000_000, 5_000_000 * self.n_nodes)
             if self.max_turns < 0:
-                self.max_turns = max(24, 4 * self.n_nodes)                          # ~3.5x the calibrated 1.1/node
+                self.max_turns = max(48, 8 * self.n_nodes)
             log(f"[guard] cost guard: {self.max_total_tokens} tokens / {self.max_turns} turns"
                 + (f" / absolute {self.max_total_tokens_abs}" if self.max_total_tokens_abs else ""))
 
             self.tests_dir = locate_acceptance_tests(tree, BUNDLE_DIR)
             if self.tests_dir:
-                specs = sorted(str(p.relative_to(self.tests_dir)) for p in self.tests_dir.rglob("*.spec.ts"))
+                specs = sorted(str(p.relative_to(self.tests_dir)) for p in acceptance_files(self.tests_dir))
                 self.spec_map, self.aliases = map_specs_to_nodes(specs, node_ids, log)
                 log(f"[tests] {len(specs)} spec files at {self.tests_dir}; mapping "
                     f"{ {k: v for k, v in self.spec_map.items() if v} }; aliases {self.aliases}")

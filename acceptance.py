@@ -26,15 +26,28 @@ from typing import Callable
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _SPEC_ID = re.compile(r"^(REQ-\d+(?:[.-]\d+)*)(?=[.\-_ ]|$)")
+TEST_FILE_SUFFIXES = (".spec.ts", ".spec.js", ".spec.mjs", ".test.ts", ".test.js", ".test.mjs")
+
+
+def is_acceptance_file(path: Path) -> bool:
+    """Recognize the common Playwright test filename variants."""
+    name = path.name.lower()
+    return any(name.endswith(suffix) for suffix in TEST_FILE_SUFFIXES)
+
+
+def acceptance_files(root: Path) -> list[Path]:
+    return sorted((p for p in root.rglob("*") if p.is_file() and is_acceptance_file(p)),
+                  key=lambda p: p.as_posix())
 
 
 def spec_node_id(rel_path: str) -> str | None:
     """`REQ-1.2-user-login.spec.ts` -> `REQ-1.2`, `REQ-1-1-1-x.spec.ts` -> `REQ-1-1-1`;
     non-spec files -> None."""
     name = Path(rel_path).name
-    if not name.endswith(".spec.ts"):
+    suffix = next((s for s in TEST_FILE_SUFFIXES if name.lower().endswith(s)), None)
+    if suffix is None:
         return None
-    m = _SPEC_ID.match(name)
+    m = _SPEC_ID.match(name[:-len(suffix)])
     return m.group(1) if m else None
 
 
@@ -999,7 +1012,7 @@ class AcceptanceRunner:
         shutil.copytree(self.tests_dir, self.work_dir / "tests",
                         ignore=shutil.ignore_patterns("node_modules", "test-results", "playwright-report"))
         shutil.copyfile(Path(__file__).with_name("page_errors.ts"), self.work_dir / "page_errors.ts")
-        for spec in (self.work_dir / "tests").rglob("*.spec.ts"):
+        for spec in acceptance_files(self.work_dir / "tests"):
             source = spec.read_text(encoding="utf-8")
             alias = "__octosObservePageErrors"
             while alias in source:
