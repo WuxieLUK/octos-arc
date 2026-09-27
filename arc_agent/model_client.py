@@ -50,10 +50,13 @@ class ChatClient:
                 choices = payload.get("choices") or []
                 if not choices or not isinstance(choices[0].get("message"), dict):
                     raise ModelError("Model response contained no assistant message")
+                message = choices[0]["message"]
+                if message.get("tool_calls") and message.get("content") is None:
+                    message["content"] = ""
                 usage = payload.get("usage") or {}
                 self.prompt_tokens += int(usage.get("prompt_tokens", 0) or 0)
                 self.completion_tokens += int(usage.get("completion_tokens", 0) or 0)
-                return Reply(choices[0]["message"], usage)
+                return Reply(message, usage)
             except error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")[:2500]
                 if exc.code not in self.RETRYABLE or attempt == 4:

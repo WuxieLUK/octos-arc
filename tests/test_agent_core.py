@@ -115,6 +115,7 @@ class ModelClientTests(unittest.TestCase):
             client.complete(next_messages, [{"type": "function"}])
         self.assertEqual(result.message["reasoning_content"], "plan")
         self.assertEqual(result.message["tool_calls"][0]["id"], "call-1")
+        self.assertEqual(result.message["content"], "")
         request_body = json.loads(mock.call_args_list[0].args[0].data)
         self.assertEqual(request_body["thinking"]["type"], "enabled")
         self.assertIn("tools", request_body)
@@ -122,6 +123,7 @@ class ModelClientTests(unittest.TestCase):
         self.assertEqual(client.prompt_tokens, 6)
         followup_body = json.loads(mock.call_args_list[1].args[0].data)
         self.assertEqual(followup_body["messages"][1]["reasoning_content"], "plan")
+        self.assertEqual(followup_body["messages"][1]["content"], "")
 
 
 class ConfigTests(unittest.TestCase):
@@ -149,6 +151,18 @@ class ConfigTests(unittest.TestCase):
 
 
 class VisionToolTests(unittest.TestCase):
+    def test_native_deepseek_flash_vision_reuses_the_primary_client(self):
+        for model in ("deepseek-flash", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp"):
+            with self.subTest(model=model), patch.dict(os.environ, {
+                "OPENAI_API_KEY": "primary-key", "OPENAI_BASE_URL": "https://main.example/v1", "MODEL": model,
+            }, clear=True):
+                config = Config.from_env(Path("requirements"), Path("output"))
+                with patch("arc_agent.orchestrator.ChatClient") as client_type:
+                    primary_client = Mock()
+                    client_type.return_value = primary_client
+                    agent = Agent(config, runtime=None)
+                self.assertIs(agent.vision_client, primary_client)
+
     def test_vision_failure_is_reported_without_exposing_the_key(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

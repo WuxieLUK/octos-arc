@@ -8,7 +8,7 @@ This project starts from the supplied ARC-Bench blank starter and replaces its g
 python3 main.py /path/to/requirements --output-dir /path/to/output --type web
 ```
 
-The runner must inject `OPENAI_API_KEY`, `OPENAI_BASE_URL`, and `MODEL`. Reference-image analysis uses `VISUAL_API_KEY`, `VISUAL_BASE_URL`, and `VISUAL_MODEL` when supplied, falling back to the primary endpoint/key if only a separate model name is configured. Runtime limits can be tuned through `ARC_AGENT_TIME_BUDGET`, `ARC_AGENT_MAX_TOOL_ROUNDS`, `ARC_AGENT_REQUEST_TIMEOUT`, `ARC_AGENT_MAX_OUTPUT_TOKENS`, and `ARC_AGENT_MAX_FILE_BYTES`.
+The runner must inject `OPENAI_API_KEY`, `OPENAI_BASE_URL`, and `MODEL`. Reference-image analysis uses `VISUAL_API_KEY`, `VISUAL_BASE_URL`, and `VISUAL_MODEL` when supplied, falling back to the primary endpoint/key if only a separate model name is configured. DeepSeek Flash native-vision model IDs can analyze references through the primary client when no separate vision model is configured. Runtime limits can be tuned through `ARC_AGENT_TIME_BUDGET`, `ARC_AGENT_MAX_TOOL_ROUNDS`, `ARC_AGENT_REQUEST_TIMEOUT`, `ARC_AGENT_MAX_OUTPUT_TOKENS`, and `ARC_AGENT_MAX_FILE_BYTES`.
 
 The agent copies missing starter files without overwriting existing workspace files, parses the requirement tree (including dotted and hyphenated IDs), uses model tool calls to inspect and implement the app, then builds and starts it locally. Completion requires the generated frontend build, a successful `GET /api/health`, a working root response, and a 404 for an unknown URL. The optional test validation runs both frontend and backend test scripts. The agent records only interfaces linked to existing source files and never replaces the platform-seeded requirement/scenario tables.
 

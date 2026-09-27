@@ -27,6 +27,8 @@ class Agent:
         if config.vision_model and config.vision_endpoint and config.vision_api_key:
             self.vision_client = ChatClient(config.vision_endpoint, config.vision_api_key,
                                             config.vision_model, config.request_timeout, config.max_tokens)
+        elif config.model.lower() in {"deepseek-flash", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp"}:
+            self.vision_client = self.client
         self.tree: RequirementTree | None = None
         self.tools: WorkspaceTools | None = None
         self.started = 0.0
@@ -52,8 +54,7 @@ class Agent:
         for turn in range(self.config.max_tool_rounds):
             self._check_deadline()
             reply = self.client.complete(messages, TOOLS)
-            message = reply.message
-            messages.append(message)
+            messages.append(reply.message)
             calls = message.get("tool_calls") or []
             if not calls:
                 if self.tools.last_validation and self.tools.last_validation.get("phase") == "startup" and self.tools.last_validation.get("ok"):
