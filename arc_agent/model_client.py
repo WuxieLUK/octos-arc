@@ -38,7 +38,7 @@ class ChatClient:
         if "deepseek" in selected.lower():
             body["thinking"] = {"type": "enabled"}
         if tools:
-            body.update({"tools": tools, "tool_choice": "auto"})
+            body["tools"] = tools
         data = json.dumps(body, ensure_ascii=False).encode()
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}"}
         for attempt in range(5):

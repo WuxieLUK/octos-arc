@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "arcbench-agent-runtime" / "src"))
 
+from arc_agent.config import Config
 from arc_agent.model_client import ChatClient
+from arc_agent.orchestrator import Agent
 from arc_agent.requirements_tree import load_tree
 from arc_agent.validator import AppValidator
 from arc_agent.workspace_tools import WorkspaceTools
@@ -104,13 +108,88 @@ class ModelClientTests(unittest.TestCase):
             def __exit__(self, *args): return False
             def read(self): return json.dumps(payload).encode()
 
-        with patch("arc_agent.model_client.request.urlopen", return_value=FakeResponse()) as mock:
+        with patch("arc_agent.model_client.request.urlopen", side_effect=[FakeResponse(), FakeResponse()]) as mock:
             result = client.complete([{"role": "user", "content": "go"}], [{"type": "function"}])
+            next_messages = [{"role": "user", "content": "go"}, result.message,
+                             {"role": "tool", "tool_call_id": "call-1", "name": "list_files", "content": "{}"}]
+            client.complete(next_messages, [{"type": "function"}])
         self.assertEqual(result.message["reasoning_content"], "plan")
         self.assertEqual(result.message["tool_calls"][0]["id"], "call-1")
-        request_body = json.loads(mock.call_args.args[0].data)
+        request_body = json.loads(mock.call_args_list[0].args[0].data)
         self.assertEqual(request_body["thinking"]["type"], "enabled")
-        self.assertEqual(client.prompt_tokens, 3)
+        self.assertIn("tools", request_body)
+        self.assertNotIn("tool_choice", request_body)
+        self.assertEqual(client.prompt_tokens, 6)
+        followup_body = json.loads(mock.call_args_list[1].args[0].data)
+        self.assertEqual(followup_body["messages"][1]["reasoning_content"], "plan")
+
+
+class ConfigTests(unittest.TestCase):
+    def test_uses_the_simulators_separate_visual_credentials(self):
+        env = {
+            "OPENAI_API_KEY": "primary-key", "OPENAI_BASE_URL": "https://main.example/v1", "MODEL": "main-model",
+            "VISUAL_API_KEY": "visual-key", "VISUAL_BASE_URL": "https://vision.example/v1",
+            "VISUAL_MODEL": "vision-model",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            config = Config.from_env(Path("requirements"), Path("output"))
+        self.assertEqual(config.endpoint, "https://main.example/v1/chat/completions")
+        self.assertEqual(config.vision_endpoint, "https://vision.example/v1/chat/completions")
+        self.assertEqual(config.api_key, "primary-key")
+        self.assertEqual(config.vision_api_key, "visual-key")
+        self.assertEqual(config.vision_model, "vision-model")
+
+    def test_visual_credentials_fall_back_to_primary_when_not_separated(self):
+        env = {"OPENAI_API_KEY": "primary-key", "OPENAI_BASE_URL": "https://main.example/v1",
+               "MODEL": "main-model", "VISION_MODEL": "vision-model"}
+        with patch.dict(os.environ, env, clear=True):
+            config = Config.from_env(Path("requirements"), Path("output"))
+        self.assertEqual(config.vision_endpoint, config.endpoint)
+        self.assertEqual(config.vision_api_key, config.api_key)
+
+
+class VisionToolTests(unittest.TestCase):
+    def test_vision_failure_is_reported_without_exposing_the_key(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "reference").mkdir()
+            (root / "reference/ui.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+            agent = Agent.__new__(Agent)
+            agent.config = SimpleNamespace(requirement_dir=root, vision_model="vision", vision_api_key="visual-secret")
+            agent.vision_client = Mock()
+            agent.vision_client.complete.side_effect = RuntimeError("service rejected visual-secret")
+            result = agent._execute("inspect_reference_image", {"path": "reference/ui.png", "question": "Read the form"})
+        self.assertFalse(result["ok"])
+        self.assertNotIn("visual-secret", result["error"])
+        self.assertIn("Continue from written requirements", result["error"])
+
+
+class ContextCompactionTests(unittest.TestCase):
+    def test_tool_arguments_must_be_a_json_object(self):
+        self.assertEqual(Agent._parse_tool_arguments(None), {})
+        self.assertEqual(Agent._parse_tool_arguments('{"path":"App.tsx"}'), {"path": "App.tsx"})
+        with self.assertRaisesRegex(ValueError, "must be an object"):
+            Agent._parse_tool_arguments('["not", "an", "object"]')
+
+    def test_checkpoint_keeps_initial_contract_recent_notes_and_workspace_files(self):
+        agent = Agent.__new__(Agent)
+        agent.tools = SimpleNamespace(tool_list_files=Mock(return_value={"files": ["frontend/src/App.tsx", "backend/src/server.js"]}))
+        agent.run_notes = ["write_file: ok - frontend/src/App.tsx (123 bytes)"]
+        original = [
+            {"role": "system", "content": "system contract"},
+            {"role": "user", "content": "full requirement contract"},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "old"}]},
+            {"role": "tool", "tool_call_id": "old", "content": "large previous output"},
+        ]
+
+        compacted = agent._compact_messages(original)
+
+        self.assertEqual(len(compacted), 3)
+        self.assertEqual(compacted[0], original[0])
+        self.assertEqual(compacted[1], original[1])
+        self.assertIn("write_file: ok", compacted[2]["content"])
+        self.assertIn("frontend/src/App.tsx", compacted[2]["content"])
+        self.assertNotIn("large previous output", compacted[2]["content"])
 
 
 if __name__ == "__main__":
