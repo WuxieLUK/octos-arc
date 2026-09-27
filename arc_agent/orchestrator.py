@@ -98,10 +98,13 @@ class Agent:
     def _compact_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         files = self.tools.tool_list_files("output").get("files", []) if self.tools else []
         notes = "\n".join(self.run_notes[-16:]) or "No tools have run yet."
+        validation = self.tools.last_validation if self.tools else None
+        validation_note = json.dumps(validation, ensure_ascii=False)[:6000] if validation else "No validation has run yet."
         checkpoint = (
             "Context checkpoint: previous tool-call transcripts were compacted. Their changes remain in the current workspace. "
             "Read files again when details are needed; do not recreate or discard existing work.\n\n"
             "Recent tool actions/results:\n" + notes +
+            "\n\nLatest validation result:\n" + validation_note +
             "\n\nCurrent output files:\n" + "\n".join(files[:300])
         )
         return [messages[0], messages[1], {"role": "user", "content": checkpoint[:16000]}]

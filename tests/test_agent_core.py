@@ -173,7 +173,10 @@ class ContextCompactionTests(unittest.TestCase):
 
     def test_checkpoint_keeps_initial_contract_recent_notes_and_workspace_files(self):
         agent = Agent.__new__(Agent)
-        agent.tools = SimpleNamespace(tool_list_files=Mock(return_value={"files": ["frontend/src/App.tsx", "backend/src/server.js"]}))
+        agent.tools = SimpleNamespace(
+            tool_list_files=Mock(return_value={"files": ["frontend/src/App.tsx", "backend/src/server.js"]}),
+            last_validation={"phase": "startup", "ok": False, "error": "unknown route returned 200"},
+        )
         agent.run_notes = ["write_file: ok - frontend/src/App.tsx (123 bytes)"]
         original = [
             {"role": "system", "content": "system contract"},
@@ -188,6 +191,7 @@ class ContextCompactionTests(unittest.TestCase):
         self.assertEqual(compacted[0], original[0])
         self.assertEqual(compacted[1], original[1])
         self.assertIn("write_file: ok", compacted[2]["content"])
+        self.assertIn("unknown route returned 200", compacted[2]["content"])
         self.assertIn("frontend/src/App.tsx", compacted[2]["content"])
         self.assertNotIn("large previous output", compacted[2]["content"])
 
