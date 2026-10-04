@@ -1,27 +1,84 @@
-# Octos ARC — Full Rewrite Agent
+# Octos ARC · ARC-Bench 初赛前测试阶段
 
-> 面向 **ARC-Bench Web 任务** 的自主实现 Agent：从空白 starter 出发，理解需求树，通过模型工具调用完成 React/Vite + Express/SQLite 应用的实现、构建、启动与本地验收。项目不依赖 Octos，也不复用 v5 编排循环。
+> 这个仓库对应 ARC-Bench 黑客松里，**初赛（9.24–9.30）之前**的测试阶段：拿 12306、携程、Keep、BookStack、StackOverflow 这些公开基准题，把 Agent 从“能跑”磨到“会自己发现并解决问题”。
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://python.org)
 [![ARC-Bench](https://img.shields.io/badge/ARC--Bench-agent-8A2BE2)](#)
 [![Stack](https://img.shields.io/badge/Stack-React%20%2B%20Vite%20%2B%20Express%20%2B%20SQLite-61DAFB?logo=react&logoColor=white)](#)
-[![Tests](https://img.shields.io/badge/tests-unittest-blue)](#tests)
 
-## 它做什么
+## 一句话背景
 
-1. 从 ARC-Bench 空白 starter 初始化工作区，只补缺失文件、不覆盖已有文件。
-2. 解析需求树：兼容 `REQ-1.2` 与 `REQ-1-1-1` 两种 ID，自动依赖排序并拒绝环。
-3. 在受控工具集中执行“读取需求 → 写代码 → 构建 → 启动 → 验证 → 修复”循环。
-4. 交付前验收：前端构建成功、`GET /api/health` 返回成功、根路径可用、未知 URL 返回 404；可选运行前后端测试。
-5. 写入 ARC-Bench 要求的 runner events、traceability 与 git 记录。
+ARC-Bench 不是“写一个网站”，而是一条完整链路：
 
-## 为什么有竞争力
+```text
+需求文档 → Agent → 生成应用 → 构建 / 启动 → Playwright 自动评测 → 得分
+```
 
-- **Task-agnostic 设计**：不针对具体题硬编码，只依赖 requirements tree 与通用工具契约。
-- **可验证交付**：不是“生成完就结束”，而是真实 build + start + 接口断言全部通过才算完成。
-- **受控工具边界**：路径沙箱、接口记录只接受真实存在的源文件，不伪造 traceability。
-- **上下文压缩与 checkpoint**：长任务中保留初始契约、近期工作笔记与关键文件列表，避免丢失目标。
-- **视觉参考双通道**：可用 `VISUAL_*` 独立配置，未配置时回退主模型；支持 DeepSeek Flash 原生视觉模型。
+Agent 拿到一份陌生需求，要自己理解、写代码、跑起来、测出来、发现问题、修掉，最后交出一个能被浏览器自动验收的应用。`octos-arc` 就是这条链路里的 Agent。
+
+## 初赛前，我们在测什么
+
+初赛是两个未知赛题，但赛前平台给了公开基准题。我们把它们当成“照妖镜”，一道一道本地跑：
+
+| 题目 | 类型 | 测试结论 |
+| --- | --- | --- |
+| `smoke--dice` | 冒烟 | **100% 通过** |
+| `smoke--counter` | 冒烟 | 本地复现通过；早期在前后端构建环节卡过 |
+| `arc-bench-web--12306` | 铁路购票 | 本地复现打磨（订票题默认连 3301 端口，平台起在 3000，为此补了双端口监听） |
+| `arc-bench-web--ctrip` | 旅行预订 | 本地复现打磨 |
+| `arc-bench-web--keep` | 健身 | **32/32 通过**，代价巨大：~127 min / ~1930 万 tokens / ~16.77 CNY / 315 次请求 / 147 次 repair |
+| `arc-bench-web--bookstack` | 文档站 | 本地复现打磨 |
+| `arc-bench-web--prestashop` | 电商 | 本地复现打磨 |
+| `arc-bench-web--stackoverflow` | 问答社区 | **65/66 通过**，但约 9.9 h / ~2.436 亿 tokens / ~111.95 CNY / 30 个 repair turns |
+
+> 说明：12306 / ctrip / bookstack / prestashop 这些题当时主要用于本地复现和打磨，没有保留公开分数的就不编数字；Keep 与 StackOverflow 是当时记录最完整的两道。
+
+## 时间线（初赛前）
+
+- **09-17** 第一次 smoke 摸底：Dice **100% 通过**、Lite 前端 `npm run build` 失败 → 定下「本地复现 + 看真实日志」的排障方法。
+- **09-17 ~ 09-23** 用官方本地模拟环境（[code-philia/hackathon-local-simulation](https://github.com/code-philia/hackathon-local-simulation)）逐题跑公开基准。
+- **Keep 32/32** → 第一次意识到「能做对」不等于「设计好」。
+- **StackOverflow 65/66** → 锁定 repair 是最大的成本黑洞。
+- **09-23** 建立 GitHub 版本管理，v1/v2/v3 与同学同步开发，所有 bundle 可追溯。
+- **09-24 起** 进入初赛（两个未知赛题）。
+
+## 这个阶段最重要的三个认知
+
+1. **能跑通 ≠ 设计好。** Keep 32/32，但花了 127 分钟、1930 万 tokens——对 Agent 来说，通过不是唯一目标，代价同样重要。
+2. **Repair 是成本黑洞。** StackOverflow 65/66 的背后是 9.9 小时、2.436 亿 tokens。无脑「重观察 → 重思考 → 重改 → 全量重测」会把任务复杂度直接放大成账单。
+3. **不要 task-specific optimization。** 我们坚决不给 12306、Keep、BookStack 各写一套策略；要的是「以不变应万变」的稳定流水线，而不是背题。
+
+## 测试阶段的做法
+
+```text
+需求树 → 拓扑排序 → 逐节点[设计 → 实现 → 本地验收 → 修复 ≤ 5 轮 → commit] → 打包上传
+```
+
+- 本地验收直接复用平台原版 Playwright 测试，改前改后跑同一套，只比数字。
+- 守护规则：未验证不得宣称完成、连续同一错误触发止损、保护路径不可改。
+- 订票类题目的端口陷阱：测试默认连 3301，平台起在 3000，所以后端两个端口都监听。
+
+## 当前代码（本仓库）
+
+初赛前的测试阶段，实际跑 12306 等公开题的实现基于 Octos 内核 + `arc/` 适配层；当前仓库里的 `arc_agent/` 是那之后的轻量重写，**不依赖 Octos**。
+
+```text
+main.py                  # 入口
+arc_agent/               # 重写后的 Agent：需求树 / 模型工具循环 / 校验 / 编排
+arcbench-agent-runtime/  # runner events / traceability / gitops
+skills/                  # ARC-Bench skills
+template/                # Web 应用 starter
+examples/                # 模型调用与 SDK 示例
+```
+
+| 模块 | 说明 |
+| --- | --- |
+| `arc_agent/requirements_tree.py` | YAML 解析、依赖排序、prompt 序列化 |
+| `arc_agent/model_client.py` | OpenAI 兼容 chat / tool-call，带重试与用量统计 |
+| `arc_agent/workspace_tools.py` | 受控源码工具与 SDK 接口记录 |
+| `arc_agent/validator.py` | 构建、启动与 HTTP 契约校验 |
+| `arc_agent/orchestrator.py` | 模型 / 工具循环、deadline、最终验收与 checkpoint |
+| `arc_agent/config.py` | 环境变量与运行限制解析 |
 
 ## 快速开始
 
@@ -42,50 +99,19 @@ python3 main.py /path/to/requirements --output-dir /path/to/output --type web
 Runner 至少注入以下环境变量：
 
 | 变量 | 是否必需 | 说明 |
-|---|---|---|
+| --- | --- | --- |
 | `OPENAI_API_KEY` | 必需 | 主模型 API Key |
 | `OPENAI_BASE_URL` | 必需 | OpenAI 兼容 Chat 端点 |
 | `MODEL` | 必需 | 主模型名称 |
-| `VISUAL_API_KEY` | 可选 | 独立视觉模型 Key，未配置回退主模型 |
+| `VISUAL_API_KEY` | 可选 | 独立视觉模型 Key，不配置回退主模型 |
 | `VISUAL_BASE_URL` | 可选 | 独立视觉模型端点 |
 | `VISUAL_MODEL` | 可选 | 视觉模型名称 |
 
-运行限制均可通过环境变量调优：`ARC_AGENT_TIME_BUDGET`、`ARC_AGENT_MAX_TOOL_ROUNDS`、`ARC_AGENT_REQUEST_TIMEOUT`、`ARC_AGENT_MAX_OUTPUT_TOKENS`、`ARC_AGENT_MAX_FILE_BYTES`。
+运行限制可用环境变量调优：`ARC_AGENT_TIME_BUDGET`、`ARC_AGENT_MAX_TOOL_ROUNDS`、`ARC_AGENT_REQUEST_TIMEOUT`、`ARC_AGENT_MAX_OUTPUT_TOKENS`、`ARC_AGENT_MAX_FILE_BYTES`。
 
-## 工作流程
+## 后续
 
-```text
-starter 初始化
-   → 需求树解析（依赖排序 / 环检测 / 完整 scenario）
-   → 模型工具循环（inspect → implement → build → start → validate）
-   → 修复与 checkpoint
-   → 最终验收（frontend build / health / root / 404）
-   → traceability 与 runner events 落盘
-```
+- 初赛（09-24 ~ 09-30）之后，10.01 起的新一轮演进与全部 bundle 见 [`WuxieLUK/arcbench-agent-journey`](https://github.com/WuxieLUK/arcbench-agent-journey)。
+- 9 月以来的完整复盘见 `WuxieLUK/arc-bench-hackathon-review`（私有）。
 
-## 模块
-
-| 路径 | 说明 |
-|---|---|
-| `arc_agent/requirements_tree.py` | YAML 解析、依赖排序、prompt 序列化 |
-| `arc_agent/model_client.py` | OpenAI 兼容 chat / tool-call 传输，带重试与用量统计 |
-| `arc_agent/workspace_tools.py` | 受控源码工具与 SDK 接口记录 |
-| `arc_agent/validator.py` | 构建、启动与 HTTP 契约校验 |
-| `arc_agent/orchestrator.py` | 模型 / 工具循环、starter 初始化、deadline、最终验收与 checkpoint |
-| `arc_agent/config.py` | 环境变量与运行限制解析 |
-| `arcbench-agent-runtime/` | runner events、traceability、gitops 辅助包 |
-| `skills/` | checkpoint、runtime-signals、traceability 三个 ARC-Bench skill |
-| `template/` | React + Vite + Express + SQLite 生成模板 |
-| `tests/` | agent core 单元测试 |
-
-## 测试
-
-```bash
-python3 -m unittest discover -s tests -v
-```
-
-## 边界
-
-- 当前目标类型为 `web`，使用内置 React/Vite + Express/SQLite 模板。
-- 仅实现 agent 侧生成逻辑，不依赖 Octos 或 v5 编排循环。
-- 视觉分析是可选增强；未配置 `VISUAL_*` 时依赖文字需求继续执行。
+> 所有成绩以 ARC-Bench 官方最终结果为准；本仓库只记录初赛前测试阶段的本地复现过程。
