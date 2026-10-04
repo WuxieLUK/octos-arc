@@ -109,6 +109,17 @@ Runner 至少注入以下环境变量：
 
 运行限制可用环境变量调优：`ARC_AGENT_TIME_BUDGET`、`ARC_AGENT_MAX_TOOL_ROUNDS`、`ARC_AGENT_REQUEST_TIMEOUT`、`ARC_AGENT_MAX_OUTPUT_TOKENS`、`ARC_AGENT_MAX_FILE_BYTES`。
 
+
+## runs/ · 保留的正式 run 记录
+
+初赛前测试阶段的 3 个官方 run 导出 + 1 份具体测试日志：
+
+| 文件 | 题目 | 结果 |
+| --- | --- | --- |
+| `runs/5023c6c54362-run-export.json` | `arc-bench-web--12306` | **PASSED 100 分，135/135 通过**；~12.1 h / 2.89 亿 tokens |
+| `runs/3ba956e27e8b-run-export.json` | `arc-bench-web--keep` | **PASSED 100 分，32/32 通过**；~3.6 h / 7063 万 tokens |
+| `runs/e7a1cccd5e6c-run-export.json` | `arc-bench-web--stackoverflow` | FAILED 98.5 分，65/66 通过；~9.9 h / 2.44 亿 tokens（Repair 成本黑洞的来源） |
+| `runs/12306-stdout.log` | `arc-bench-web--12306` | 12306 那次 run 的完整 runner + agent 标准输出日志 |
 ## 后续
 
 - 初赛（09-24 ~ 09-30）之后，10.01 起的新一轮演进与全部 bundle 见 [`WuxieLUK/arcbench-agent-journey`](https://github.com/WuxieLUK/arcbench-agent-journey)。
